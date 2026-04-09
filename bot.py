@@ -357,6 +357,7 @@ def build_summary(spreadsheet) -> str:
     text += f"📈 Клиенты должны: ${clients_owe:,.2f}\n"
     text += f"💰 Баланс (получено - расходы - ЗП): ${balance:,.2f}\n"
 
+  
     if expenses_by_category:
         text += "\n*Все расходы по категориям:*\n"
         for cat, amt in sorted(expenses_by_category.items()):
