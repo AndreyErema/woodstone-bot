@@ -374,15 +374,22 @@ def build_summary(spreadsheet) -> str:
 
 
 def update_summary_sheet(spreadsheet):
-    """Обновить лист Сводка в таблице."""
+    """Обновить лист Сводка: актуальные итоги + колонка на каждую неделю (пн-вс)."""
     try:
         now = datetime.now()
-        week_ago = now - timedelta(days=7)
-        week_ago_str = week_ago.strftime("%Y-%m-%d")
 
-        # --- Данные проектов ---
+        # --- Собираем все данные ---
         projects_sheet = spreadsheet.worksheet("Проекты")
+        payments_sheet = spreadsheet.worksheet("Платежи")
+        expenses_sheet = spreadsheet.worksheet("Расходы")
+        zp_sheet = spreadsheet.worksheet("ЗП")
+
         all_projects = projects_sheet.get_all_values()
+        all_payments = payments_sheet.get_all_values()
+        all_expenses = expenses_sheet.get_all_values()
+        all_zp = zp_sheet.get_all_values()
+
+        # --- Актуальные итоги ---
         total_price = 0
         total_received = 0
         total_expenses_all = 0
@@ -403,106 +410,245 @@ def update_summary_sheet(spreadsheet):
                     active_count += 1
             except (ValueError, IndexError):
                 continue
-        clients_owe = total_price - total_received
 
-        # --- Платежи за неделю ---
-        payments_sheet = spreadsheet.worksheet("Платежи")
-        week_payments = 0
-        for row in payments_sheet.get_all_values()[1:]:
-            try:
-                date_str = row[3][:10] if len(row) > 3 else ""
-                if date_str >= week_ago_str:
-                    week_payments += float(row[2])
-            except (ValueError, IndexError):
-                continue
-
-        # --- Расходы по категориям ---
-        expenses_sheet = spreadsheet.worksheet("Расходы")
-        expenses_by_category = {}
-        week_expenses = 0
-        week_expenses_by_category = {}
-        for row in expenses_sheet.get_all_values()[1:]:
-            try:
-                category = row[2] if len(row) > 2 else "Прочее"
-                amount = float(row[3]) if len(row) > 3 else 0
-                date_str = row[5][:10] if len(row) > 5 else ""
-                expenses_by_category[category] = expenses_by_category.get(category, 0) + amount
-                if date_str >= week_ago_str:
-                    week_expenses += amount
-                    week_expenses_by_category[category] = week_expenses_by_category.get(category, 0) + amount
-            except (ValueError, IndexError):
-                continue
-
-        # --- ЗП ---
-        zp_sheet = spreadsheet.worksheet("ЗП")
         total_zp = 0
-        week_zp = 0
         zp_by_sub = {}
-        for row in zp_sheet.get_all_values()[1:]:
+        for row in all_zp[1:]:
             try:
                 sub_name = row[0] if row[0] else "?"
                 amount = float(row[1]) if len(row) > 1 else 0
-                date_str = row[2][:10] if len(row) > 2 else ""
                 total_zp += amount
                 zp_by_sub[sub_name] = zp_by_sub.get(sub_name, 0) + amount
-                if date_str >= week_ago_str:
-                    week_zp += amount
             except (ValueError, IndexError):
                 continue
 
+        expenses_by_category = {}
+        for row in all_expenses[1:]:
+            try:
+                category = row[2] if len(row) > 2 else "Прочее"
+                amount = float(row[3]) if len(row) > 3 else 0
+                expenses_by_category[category] = expenses_by_category.get(category, 0) + amount
+            except (ValueError, IndexError):
+                continue
+
+        clients_owe = total_price - total_received
         balance = total_received - total_expenses_all - total_zp
 
-        # --- Записать в лист Сводка ---
+        # --- Собираем все даты чтобы определить диапазон недель ---
+        all_dates = []
+        for row in all_payments[1:]:
+            try:
+                all_dates.append(row[3][:10])
+            except (IndexError, ValueError):
+                continue
+        for row in all_expenses[1:]:
+            try:
+                all_dates.append(row[5][:10])
+            except (IndexError, ValueError):
+                continue
+        for row in all_zp[1:]:
+            try:
+                all_dates.append(row[2][:10])
+            except (IndexError, ValueError):
+                continue
+
+        if not all_dates:
+            all_dates = [now.strftime("%Y-%m-%d")]
+
+        # Найти самую раннюю дату
+        min_date_str = min(all_dates)
+        try:
+            min_date = datetime.strptime(min_date_str, "%Y-%m-%d")
+        except ValueError:
+            min_date = now
+
+        # --- Генерируем список недель (пн-вс) от текущей назад ---
+        def get_week_start(dt):
+            """Получить понедельник недели."""
+            return dt - timedelta(days=dt.weekday())
+
+        current_week_start = get_week_start(now)
+        first_week_start = get_week_start(min_date)
+
+        weeks = []
+        ws = current_week_start
+        while ws >= first_week_start:
+            we = ws + timedelta(days=6)
+            weeks.append((ws, we))
+            ws = ws - timedelta(days=7)
+
+        # --- Считаем данные по каждой неделе ---
+        def in_week(date_str, week_start, week_end):
+            try:
+                return week_start.strftime("%Y-%m-%d") <= date_str[:10] <= week_end.strftime("%Y-%m-%d")
+            except (ValueError, IndexError):
+                return False
+
+        week_data = []
+        for ws, we in weeks:
+            w_payments = 0
+            for row in all_payments[1:]:
+                try:
+                    if in_week(row[3], ws, we):
+                        w_payments += float(row[2])
+                except (ValueError, IndexError):
+                    continue
+
+            w_expenses = 0
+            w_exp_by_cat = {}
+            for row in all_expenses[1:]:
+                try:
+                    if in_week(row[5], ws, we):
+                        amt = float(row[3])
+                        cat = row[2] if len(row) > 2 else "Прочее"
+                        w_expenses += amt
+                        w_exp_by_cat[cat] = w_exp_by_cat.get(cat, 0) + amt
+                except (ValueError, IndexError):
+                    continue
+
+            w_zp = 0
+            w_zp_by_sub = {}
+            for row in all_zp[1:]:
+                try:
+                    if in_week(row[2], ws, we):
+                        amt = float(row[1])
+                        sub = row[0] if row[0] else "?"
+                        w_zp += amt
+                        w_zp_by_sub[sub] = w_zp_by_sub.get(sub, 0) + amt
+                except (ValueError, IndexError):
+                    continue
+
+            week_data.append({
+                "label": f"{ws.strftime('%m/%d')}-{we.strftime('%m/%d')}",
+                "payments": w_payments,
+                "expenses": w_expenses,
+                "zp": w_zp,
+                "exp_by_cat": w_exp_by_cat,
+                "zp_by_sub": w_zp_by_sub,
+            })
+
+        # --- Собираем все категории и сабов ---
+        all_categories = sorted(set(expenses_by_category.keys()))
+        all_subs = sorted(set(zp_by_sub.keys()))
+
+        # --- Строим таблицу ---
+        # Строки (фиксированные)
+        row_labels = [
+            "СВОДКА",
+            "",
+            "--- ИТОГИ ---",
+            "Активных проектов",
+            "Завершённых проектов",
+            "Общая стоимость проектов",
+            "Получено от клиентов (всего)",
+            "Расходы по проектам (всего)",
+            "ЗП сабам (всего)",
+            "Клиенты должны",
+            "БАЛАНС",
+            "",
+            "--- ЗА НЕДЕЛЮ ---",
+            "Получено от клиентов",
+            "Расходы по проектам",
+            "ЗП сабам",
+            "",
+            "Расходы по категориям:",
+        ]
+        for cat in all_categories:
+            row_labels.append(f"  {cat}")
+
+        row_labels.append("")
+        row_labels.append("ЗП по субподрядчикам:")
+        for sub in all_subs:
+            row_labels.append(f"  {sub}")
+
+        # Колонки: Показатель | Актуальное | Неделя1 | Неделя2 | ...
+        num_cols = 2 + len(weeks)  # A + Актуальное + недели
+        num_rows = len(row_labels)
+
+        # Заполняем матрицу
+        matrix = []
+        for i, label in enumerate(row_labels):
+            row = [label]
+
+            # Колонка "Актуальное"
+            if label == "СВОДКА":
+                row.append(f"Обновлено: {now.strftime('%Y-%m-%d %H:%M')}")
+            elif label == "Активных проектов":
+                row.append(active_count)
+            elif label == "Завершённых проектов":
+                row.append(completed_count)
+            elif label == "Общая стоимость проектов":
+                row.append(total_price)
+            elif label == "Получено от клиентов (всего)":
+                row.append(total_received)
+            elif label == "Расходы по проектам (всего)":
+                row.append(total_expenses_all)
+            elif label == "ЗП сабам (всего)":
+                row.append(total_zp)
+            elif label == "Клиенты должны":
+                row.append(clients_owe)
+            elif label == "БАЛАНС":
+                row.append(balance)
+            elif label == "--- ЗА НЕДЕЛЮ ---":
+                row.append("Актуальное")
+            elif label == "Расходы по категориям:":
+                row.append("")
+            elif label == "ЗП по субподрядчикам:":
+                row.append("")
+            elif label.startswith("  ") and label.strip() in expenses_by_category:
+                row.append(expenses_by_category[label.strip()])
+            elif label.startswith("  ") and label.strip() in zp_by_sub:
+                row.append(zp_by_sub[label.strip()])
+            else:
+                row.append("")
+
+            # Колонки по неделям
+            for wd in week_data:
+                if label == "--- ЗА НЕДЕЛЮ ---":
+                    row.append(wd["label"])
+                elif label == "Получено от клиентов":
+                    row.append(wd["payments"] if wd["payments"] else "")
+                elif label == "Расходы по проектам":
+                    row.append(wd["expenses"] if wd["expenses"] else "")
+                elif label == "ЗП сабам":
+                    row.append(wd["zp"] if wd["zp"] else "")
+                elif label.startswith("  ") and label.strip() in expenses_by_category:
+                    val = wd["exp_by_cat"].get(label.strip(), "")
+                    row.append(val if val else "")
+                elif label.startswith("  ") and label.strip() in zp_by_sub:
+                    val = wd["zp_by_sub"].get(label.strip(), "")
+                    row.append(val if val else "")
+                else:
+                    row.append("")
+
+            matrix.append(row)
+
+        # --- Записать в лист ---
         try:
             summary_sheet = spreadsheet.worksheet("Сводка")
             summary_sheet.clear()
         except gspread.exceptions.WorksheetNotFound:
-            summary_sheet = spreadsheet.add_worksheet(title="Сводка", rows=50, cols=3)
+            summary_sheet = spreadsheet.add_worksheet(title="Сводка", rows=50, cols=num_cols)
 
-        rows = [
-            ["СВОДКА", "", f"Обновлено: {now.strftime('%Y-%m-%d %H:%M')}"],
-            ["", "", ""],
-            ["--- ЗА НЕДЕЛЮ ---", f"{week_ago.strftime('%m/%d')} — {now.strftime('%m/%d')}", ""],
-            ["Получено от клиентов", week_payments, ""],
-            ["Расходы по проектам", week_expenses, ""],
-            ["ЗП сабам", week_zp, ""],
-            ["", "", ""],
-        ]
+        # Убедиться что хватает колонок
+        if summary_sheet.col_count < num_cols:
+            summary_sheet.resize(cols=num_cols)
 
-        # Расходы за неделю по категориям
-        if week_expenses_by_category:
-            rows.append(["Расходы за неделю по категориям:", "", ""])
-            for cat, amt in sorted(week_expenses_by_category.items()):
-                rows.append([f"  {cat}", amt, ""])
-            rows.append(["", "", ""])
-
-        rows.extend([
-            ["--- ВСЕГО ---", "", ""],
-            ["Активных проектов", active_count, ""],
-            ["Завершённых проектов", completed_count, ""],
-            ["Общая стоимость проектов", total_price, ""],
-            ["Получено от клиентов", total_received, ""],
-            ["Расходы по проектам", total_expenses_all, ""],
-            ["ЗП сабам (всего)", total_zp, ""],
-            ["Клиенты должны", clients_owe, ""],
-            ["БАЛАНС (получено - расходы - ЗП)", balance, ""],
-            ["", "", ""],
-        ])
-
-        # Все расходы по категориям
-        if expenses_by_category:
-            rows.append(["Все расходы по категориям:", "", ""])
-            for cat, amt in sorted(expenses_by_category.items()):
-                rows.append([f"  {cat}", amt, ""])
-            rows.append(["", "", ""])
-
-        # ЗП по сабам
-        if zp_by_sub:
-            rows.append(["ЗП по субподрядчикам:", "", ""])
-            for sub, amt in sorted(zp_by_sub.items()):
-                rows.append([f"  {sub}", amt, ""])
-
-        summary_sheet.update(f"A1:C{len(rows)}", rows, value_input_option="USER_ENTERED")
+        # Записать одним вызовом
+        end_col = chr(ord('A') + num_cols - 1) if num_cols <= 26 else None
+        if num_cols <= 26:
+            summary_sheet.update(
+                f"A1:{end_col}{num_rows}",
+                matrix,
+                value_input_option="USER_ENTERED"
+            )
+        else:
+            # Для большого количества колонок
+            summary_sheet.update(
+                f"A1",
+                matrix,
+                value_input_option="USER_ENTERED"
+            )
 
         logger.info("✅ Лист Сводка обновлён.")
     except Exception as e:
