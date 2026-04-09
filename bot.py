@@ -1,16 +1,19 @@
 """
-Wood & Stone Construction LLC — Telegram Project Tracker Bot v2
-Многолистовая структура Google Sheets:
-  - Лист "Проекты" — сводка (1 строка = 1 проект)
-  - Лист "Платежи" — все платежи
-  - Лист "Расходы" — все расходы
-  - Лист "Обновления" — описания статуса
+Wood & Stone Construction LLC — Telegram Project Tracker Bot v3
+Листы Google Sheets:
+  - Проекты — сводка (1 строка = 1 проект)
+  - Платежи — все входящие платежи от клиентов
+  - Расходы — все расходы по проектам
+  - Обновления — описания статуса
+  - Сабы — список субподрядчиков
+  - ЗП — оплаты субподрядчикам (без привязки к проекту)
+  - Сводка — общая статистика
 """
 
 import os
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup,
     ReplyKeyboardMarkup, ReplyKeyboardRemove
@@ -65,7 +68,10 @@ logger = logging.getLogger(__name__)
     CHANGE_STATUS_SELECT_PROJECT,
     CHANGE_STATUS_VALUE,
     VIEW_STATUS_SELECT_PROJECT,
-) = range(15)
+    ADD_SUB_NAME,
+    SUB_PAY_SELECT_SUB,
+    SUB_PAY_AMOUNT,
+) = range(18)
 
 # ============================================================
 # GOOGLE SHEETS — ПОДКЛЮЧЕНИЕ
@@ -78,7 +84,6 @@ SCOPES = [
 
 
 def get_google_creds():
-    """Получить credentials для Google API."""
     creds_json = os.environ.get("GOOGLE_CREDS_JSON", "")
     if creds_json:
         creds_info = json.loads(creds_json)
@@ -89,7 +94,6 @@ def get_google_creds():
 
 
 def get_spreadsheet():
-    """Подключиться к Google Sheets и вернуть spreadsheet."""
     creds = get_google_creds()
     client = gspread.authorize(creds)
     spreadsheet = client.open_by_key(SPREADSHEET_ID)
@@ -97,7 +101,6 @@ def get_spreadsheet():
 
 
 def get_or_create_sheet(spreadsheet, title, headers):
-    """Получить лист или создать с заголовками."""
     try:
         sheet = spreadsheet.worksheet(title)
     except gspread.exceptions.WorksheetNotFound:
@@ -107,23 +110,28 @@ def get_or_create_sheet(spreadsheet, title, headers):
 
 
 def init_sheets(spreadsheet):
-    """Инициализировать все листы."""
     projects = get_or_create_sheet(spreadsheet, "Проекты", [
         "Project ID", "Адрес", "Описание", "Цена",
         "Статус", "Получено", "Расходы", "Баланс",
         "Дата создания", "Создал"
     ])
-    payments = get_or_create_sheet(spreadsheet, "Платежи", [
+    get_or_create_sheet(spreadsheet, "Платежи", [
         "Project ID", "Адрес", "Сумма", "Дата", "Кто записал"
     ])
-    expenses = get_or_create_sheet(spreadsheet, "Расходы", [
+    get_or_create_sheet(spreadsheet, "Расходы", [
         "Project ID", "Адрес", "Категория", "Сумма",
         "Описание", "Дата", "Кто записал"
     ])
-    updates = get_or_create_sheet(spreadsheet, "Обновления", [
+    get_or_create_sheet(spreadsheet, "Обновления", [
         "Project ID", "Адрес", "Текст", "Дата", "Кто записал"
     ])
-    return projects, payments, expenses, updates
+    get_or_create_sheet(spreadsheet, "Сабы", [
+        "Имя", "Дата добавления", "Кто добавил"
+    ])
+    get_or_create_sheet(spreadsheet, "ЗП", [
+        "Субподрядчик", "Сумма", "Дата", "Кто записал"
+    ])
+    return projects
 
 
 # ============================================================
@@ -131,13 +139,11 @@ def init_sheets(spreadsheet):
 # ============================================================
 
 def check_access(update: Update) -> bool:
-    user_id = update.effective_user.id
-    return user_id in ALLOWED_USERS
+    return update.effective_user.id in ALLOWED_USERS
 
 
 def get_user_name(update: Update) -> str:
-    user_id = update.effective_user.id
-    return ALLOWED_USERS.get(user_id, "Unknown")
+    return ALLOWED_USERS.get(update.effective_user.id, "Unknown")
 
 
 def get_user_name_by_id(user_id: int) -> str:
@@ -145,7 +151,6 @@ def get_user_name_by_id(user_id: int) -> str:
 
 
 def get_next_project_id(projects_sheet) -> str:
-    """Получить следующий ID проекта (0001, 0002, ...)."""
     all_records = projects_sheet.get_all_values()
     if len(all_records) <= 1:
         return "0001"
@@ -161,7 +166,6 @@ def get_next_project_id(projects_sheet) -> str:
 
 
 def get_active_projects(projects_sheet) -> list:
-    """Получить список активных проектов (не Завершён)."""
     all_records = projects_sheet.get_all_values()
     if len(all_records) <= 1:
         return []
@@ -170,18 +174,13 @@ def get_active_projects(projects_sheet) -> list:
         try:
             status = row[4] if len(row) > 4 else "Новый"
             if status != "Завершён":
-                projects.append({
-                    "id": row[0],
-                    "address": row[1],
-                    "status": status,
-                })
+                projects.append({"id": row[0], "address": row[1], "status": status})
         except (IndexError, ValueError):
             continue
     return projects
 
 
 def get_all_projects(projects_sheet) -> list:
-    """Получить ВСЕ проекты."""
     all_records = projects_sheet.get_all_values()
     if len(all_records) <= 1:
         return []
@@ -189,8 +188,7 @@ def get_all_projects(projects_sheet) -> list:
     for row in all_records[1:]:
         try:
             projects.append({
-                "id": row[0],
-                "address": row[1],
+                "id": row[0], "address": row[1],
                 "status": row[4] if len(row) > 4 else "Новый",
             })
         except (IndexError, ValueError):
@@ -199,7 +197,6 @@ def get_all_projects(projects_sheet) -> list:
 
 
 def find_project_row(projects_sheet, project_id: str) -> int:
-    """Найти номер строки проекта в листе Проекты (1-indexed)."""
     all_records = projects_sheet.get_all_values()
     for i, row in enumerate(all_records):
         if row[0] == project_id:
@@ -208,14 +205,12 @@ def find_project_row(projects_sheet, project_id: str) -> int:
 
 
 def update_project_totals(spreadsheet, project_id: str):
-    """Пересчитать Получено, Расходы, Баланс в листе Проекты."""
     projects_sheet = spreadsheet.worksheet("Проекты")
     payments_sheet = spreadsheet.worksheet("Платежи")
     expenses_sheet = spreadsheet.worksheet("Расходы")
 
     total_paid = 0
-    payments = payments_sheet.get_all_values()
-    for row in payments[1:]:
+    for row in payments_sheet.get_all_values()[1:]:
         if row[0] == project_id:
             try:
                 total_paid += float(row[2])
@@ -223,8 +218,7 @@ def update_project_totals(spreadsheet, project_id: str):
                 continue
 
     total_expenses = 0
-    expenses = expenses_sheet.get_all_values()
-    for row in expenses[1:]:
+    for row in expenses_sheet.get_all_values()[1:]:
         if row[0] == project_id:
             try:
                 total_expenses += float(row[3])
@@ -236,20 +230,144 @@ def update_project_totals(spreadsheet, project_id: str):
         return
 
     balance = total_paid - total_expenses
-
-    # Обновляем: Получено (F), Расходы (G), Баланс (H)
     projects_sheet.update(f"F{row_num}", [[total_paid]])
     projects_sheet.update(f"G{row_num}", [[total_expenses]])
     projects_sheet.update(f"H{row_num}", [[balance]])
 
 
 def get_project_address(projects_sheet, project_id: str) -> str:
-    """Получить адрес проекта по ID."""
-    all_records = projects_sheet.get_all_values()
-    for row in all_records[1:]:
+    for row in projects_sheet.get_all_values()[1:]:
         if row[0] == project_id:
             return row[1]
     return ""
+
+
+def get_subs_list(spreadsheet) -> list:
+    try:
+        subs_sheet = spreadsheet.worksheet("Сабы")
+        all_records = subs_sheet.get_all_values()
+        if len(all_records) <= 1:
+            return []
+        return [row[0] for row in all_records[1:] if row[0]]
+    except Exception:
+        return []
+
+
+def build_summary(spreadsheet) -> str:
+    """Собрать общую сводку: за неделю, по категориям, баланс, долги клиентов."""
+    now = datetime.now()
+    week_ago = now - timedelta(days=7)
+    week_ago_str = week_ago.strftime("%Y-%m-%d")
+
+    # --- Все проекты ---
+    projects_sheet = spreadsheet.worksheet("Проекты")
+    all_projects = projects_sheet.get_all_values()
+    total_price = 0
+    total_received = 0
+    total_expenses_all = 0
+    active_count = 0
+    for row in all_projects[1:]:
+        try:
+            price = float(row[3]) if row[3] else 0
+            received = float(row[5]) if len(row) > 5 and row[5] else 0
+            expenses = float(row[6]) if len(row) > 6 and row[6] else 0
+            status = row[4] if len(row) > 4 else ""
+            total_price += price
+            total_received += received
+            total_expenses_all += expenses
+            if status != "Завершён":
+                active_count += 1
+        except (ValueError, IndexError):
+            continue
+
+    clients_owe = total_price - total_received
+
+    # --- Платежи за неделю ---
+    payments_sheet = spreadsheet.worksheet("Платежи")
+    week_payments = 0
+    for row in payments_sheet.get_all_values()[1:]:
+        try:
+            date_str = row[3][:10] if len(row) > 3 else ""
+            if date_str >= week_ago_str:
+                week_payments += float(row[2])
+        except (ValueError, IndexError):
+            continue
+
+    # --- Расходы за неделю + по категориям ---
+    expenses_sheet = spreadsheet.worksheet("Расходы")
+    week_expenses = 0
+    expenses_by_category = {}
+    week_expenses_by_category = {}
+    for row in expenses_sheet.get_all_values()[1:]:
+        try:
+            category = row[2] if len(row) > 2 else "Прочее"
+            amount = float(row[3]) if len(row) > 3 else 0
+            date_str = row[5][:10] if len(row) > 5 else ""
+
+            # Всего по категориям
+            expenses_by_category[category] = expenses_by_category.get(category, 0) + amount
+
+            # За неделю
+            if date_str >= week_ago_str:
+                week_expenses += amount
+                week_expenses_by_category[category] = week_expenses_by_category.get(category, 0) + amount
+        except (ValueError, IndexError):
+            continue
+
+    # --- ЗП за неделю + всего ---
+    zp_sheet = spreadsheet.worksheet("ЗП")
+    total_zp = 0
+    week_zp = 0
+    zp_by_sub = {}
+    for row in zp_sheet.get_all_values()[1:]:
+        try:
+            sub_name = row[0] if row[0] else "?"
+            amount = float(row[1]) if len(row) > 1 else 0
+            date_str = row[2][:10] if len(row) > 2 else ""
+            total_zp += amount
+            zp_by_sub[sub_name] = zp_by_sub.get(sub_name, 0) + amount
+            if date_str >= week_ago_str:
+                week_zp += amount
+        except (ValueError, IndexError):
+            continue
+
+    # --- Баланс ---
+    balance = total_received - total_expenses_all - total_zp
+
+    # --- Формируем текст ---
+    text = "📊 *СВОДКА*\n"
+    text += f"📅 Период: {week_ago.strftime('%m/%d')} — {now.strftime('%m/%d/%Y')}\n\n"
+
+    text += "*— За неделю —*\n"
+    text += f"💰 Получено от клиентов: ${week_payments:,.2f}\n"
+    text += f"💸 Расходы по проектам: ${week_expenses:,.2f}\n"
+    text += f"👷 ЗП сабам: ${week_zp:,.2f}\n"
+
+    if week_expenses_by_category:
+        text += "\n*Расходы за неделю по категориям:*\n"
+        for cat, amt in sorted(week_expenses_by_category.items()):
+            text += f"  • {cat}: ${amt:,.2f}\n"
+
+    text += "\n*— Всего (все время) —*\n"
+    text += f"🏗 Активных проектов: {active_count}\n"
+    text += f"💵 Общая стоимость проектов: ${total_price:,.2f}\n"
+    text += f"✅ Получено от клиентов: ${total_received:,.2f}\n"
+    text += f"💸 Расходы по проектам: ${total_expenses_all:,.2f}\n"
+    text += f"👷 ЗП сабам (всего): ${total_zp:,.2f}\n"
+    text += f"📈 Клиенты должны: ${clients_owe:,.2f}\n"
+    text += f"💰 Баланс (получено - расходы - ЗП): ${balance:,.2f}\n"
+
+    if expenses_by_category:
+        text += "\n*Все расходы по категориям:*\n"
+        for cat, amt in sorted(expenses_by_category.items()):
+            text += f"  • {cat}: ${amt:,.2f}\n"
+
+    if zp_by_sub:
+        text += "\n*ЗП по субподрядчикам:*\n"
+        for sub, amt in sorted(zp_by_sub.items()):
+            text += f"  • {sub}: ${amt:,.2f}\n"
+
+    return text
 
 
 # ============================================================
@@ -261,7 +379,8 @@ MAIN_MENU_KEYBOARD = ReplyKeyboardMarkup(
         ["📋 Новый проект", "💰 Записать платёж"],
         ["💸 Записать расход", "📝 Добавить описание"],
         ["🔄 Изменить статус", "📊 Статус проекта"],
-        ["📁 Архив"],
+        ["👷 Добавить саба", "💵 Оплата сабу"],
+        ["📈 Сводка", "📁 Архив"],
     ],
     resize_keyboard=True,
 )
@@ -311,11 +430,28 @@ async def main_menu_handler(update: Update, context) -> int:
     elif text == "📊 Статус проекта":
         return await show_project_list(update, context, VIEW_STATUS_SELECT_PROJECT, include_all=True)
 
+    elif text == "👷 Добавить саба":
+        await update.message.reply_text(
+            "👷 Введи имя субподрядчика:",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return ADD_SUB_NAME
+
+    elif text == "💵 Оплата сабу":
+        return await show_subs_list(update, context)
+
+    elif text == "📈 Сводка":
+        return await show_summary(update, context)
+
     elif text == "📁 Архив":
         return await show_archive(update, context)
 
     return MAIN_MENU
 
+
+# ============================================================
+# СПИСОК ПРОЕКТОВ
+# ============================================================
 
 async def show_project_list(update, context, next_state, include_all=False):
     try:
@@ -324,17 +460,11 @@ async def show_project_list(update, context, next_state, include_all=False):
         projects = get_all_projects(projects_sheet) if include_all else get_active_projects(projects_sheet)
     except Exception as e:
         logger.error(f"Error getting projects: {e}")
-        await update.message.reply_text(
-            "❌ Ошибка подключения к таблице.",
-            reply_markup=MAIN_MENU_KEYBOARD,
-        )
+        await update.message.reply_text("❌ Ошибка подключения.", reply_markup=MAIN_MENU_KEYBOARD)
         return MAIN_MENU
 
     if not projects:
-        await update.message.reply_text(
-            "📭 Нет активных проектов. Создай новый!",
-            reply_markup=MAIN_MENU_KEYBOARD,
-        )
+        await update.message.reply_text("📭 Нет активных проектов.", reply_markup=MAIN_MENU_KEYBOARD)
         return MAIN_MENU
 
     buttons = []
@@ -343,12 +473,10 @@ async def show_project_list(update, context, next_state, include_all=False):
         if include_all:
             label += f" [{p['status']}]"
         buttons.append([InlineKeyboardButton(label, callback_data=f"proj_{p['id']}")])
-
     buttons.append([InlineKeyboardButton("❌ Отмена", callback_data="cancel")])
 
     await update.message.reply_text(
-        "Выбери проект:",
-        reply_markup=InlineKeyboardMarkup(buttons),
+        "Выбери проект:", reply_markup=InlineKeyboardMarkup(buttons),
     )
     return next_state
 
@@ -364,17 +492,13 @@ async def show_archive(update, context):
         return MAIN_MENU
 
     archived = [p for p in all_projects if p["status"] == "Завершён"]
-
     if not archived:
-        await update.message.reply_text(
-            "📁 Архив пуст.", reply_markup=MAIN_MENU_KEYBOARD
-        )
+        await update.message.reply_text("📁 Архив пуст.", reply_markup=MAIN_MENU_KEYBOARD)
         return MAIN_MENU
 
     text = "📁 *Архив проектов:*\n\n"
     for p in archived:
         text += f"• {p['id']} — {p['address']}\n"
-
     await update.message.reply_text(text, parse_mode="Markdown", reply_markup=MAIN_MENU_KEYBOARD)
     return MAIN_MENU
 
@@ -406,7 +530,6 @@ async def new_project_description(update: Update, context) -> int:
 async def new_project_price(update: Update, context) -> int:
     try:
         price = float(update.message.text.replace(",", "").replace("$", ""))
-        context.user_data["new_price"] = price
     except ValueError:
         await update.message.reply_text("❌ Введи число. Например: 15000")
         return NEW_PROJECT_PRICE
@@ -416,21 +539,13 @@ async def new_project_price(update: Update, context) -> int:
 
     try:
         spreadsheet = get_spreadsheet()
-        projects_sheet, _, _, _ = init_sheets(spreadsheet)
+        projects_sheet = init_sheets(spreadsheet)
         project_id = get_next_project_id(projects_sheet)
 
-        # Проекты: ID | Адрес | Описание | Цена | Статус | Получено | Расходы | Баланс | Дата | Создал
         row = [
-            project_id,
-            context.user_data["new_address"],
-            context.user_data["new_description"],
-            price,
-            "Новый",
-            0,
-            0,
-            0,
-            now,
-            user_name,
+            project_id, context.user_data["new_address"],
+            context.user_data["new_description"], price,
+            "Новый", 0, 0, 0, now, user_name,
         ]
         projects_sheet.append_row(row, value_input_option="USER_ENTERED")
 
@@ -444,10 +559,7 @@ async def new_project_price(update: Update, context) -> int:
         )
     except Exception as e:
         logger.error(f"Error creating project: {e}")
-        await update.message.reply_text(
-            "❌ Ошибка при создании проекта.",
-            reply_markup=MAIN_MENU_KEYBOARD,
-        )
+        await update.message.reply_text("❌ Ошибка при создании проекта.", reply_markup=MAIN_MENU_KEYBOARD)
 
     for key in ["new_address", "new_description", "new_price"]:
         context.user_data.pop(key, None)
@@ -463,7 +575,6 @@ async def payment_select_project(update: Update, context) -> int:
     await query.answer()
     if query.data == "cancel":
         return await cancel_callback(update, context)
-
     project_id = query.data.replace("proj_", "")
     context.user_data["payment_project_id"] = project_id
     await query.edit_message_text(f"💰 Проект {project_id}.\n\nВведи сумму платежа:")
@@ -491,7 +602,6 @@ async def payment_amount(update: Update, context) -> int:
             [project_id, address, amount, now, user_name],
             value_input_option="USER_ENTERED"
         )
-
         update_project_totals(spreadsheet, project_id)
 
         await update.message.reply_text(
@@ -503,10 +613,7 @@ async def payment_amount(update: Update, context) -> int:
         )
     except Exception as e:
         logger.error(f"Error recording payment: {e}")
-        await update.message.reply_text(
-            "❌ Ошибка при записи платежа.",
-            reply_markup=MAIN_MENU_KEYBOARD,
-        )
+        await update.message.reply_text("❌ Ошибка.", reply_markup=MAIN_MENU_KEYBOARD)
 
     context.user_data.pop("payment_project_id", None)
     return MAIN_MENU
@@ -524,14 +631,10 @@ async def expense_select_project(update: Update, context) -> int:
     await query.answer()
     if query.data == "cancel":
         return await cancel_callback(update, context)
-
     project_id = query.data.replace("proj_", "")
     context.user_data["expense_project_id"] = project_id
 
-    buttons = []
-    for cat in EXPENSE_CATEGORIES:
-        buttons.append([InlineKeyboardButton(cat, callback_data=f"expcat_{cat}")])
-
+    buttons = [[InlineKeyboardButton(cat, callback_data=f"expcat_{cat}")] for cat in EXPENSE_CATEGORIES]
     await query.edit_message_text(
         f"💸 Проект {project_id}.\n\nВыбери категорию расхода:",
         reply_markup=InlineKeyboardMarkup(buttons),
@@ -542,9 +645,8 @@ async def expense_select_project(update: Update, context) -> int:
 async def expense_category(update: Update, context) -> int:
     query = update.callback_query
     await query.answer()
-    category = query.data.replace("expcat_", "")
-    context.user_data["expense_category"] = category
-    await query.edit_message_text(f"💸 Категория: {category}.\n\nВведи сумму расхода:")
+    context.user_data["expense_category"] = query.data.replace("expcat_", "")
+    await query.edit_message_text(f"💸 Категория: {context.user_data['expense_category']}.\n\nВведи сумму расхода:")
     return EXPENSE_AMOUNT
 
 
@@ -552,13 +654,10 @@ async def expense_amount(update: Update, context) -> int:
     try:
         amount = float(update.message.text.replace(",", "").replace("$", ""))
     except ValueError:
-        await update.message.reply_text("❌ Введи число. Например: 1200")
+        await update.message.reply_text("❌ Введи число.")
         return EXPENSE_AMOUNT
-
     context.user_data["expense_amount"] = amount
-    await update.message.reply_text(
-        "📝 Добавь описание расхода (или отправь «-» чтобы пропустить):"
-    )
+    await update.message.reply_text("📝 Описание расхода (или «-» чтобы пропустить):")
     return EXPENSE_DESCRIPTION
 
 
@@ -579,24 +678,19 @@ async def expense_description(update: Update, context) -> int:
              context.user_data["expense_amount"], description, now, user_name],
             value_input_option="USER_ENTERED"
         )
-
         update_project_totals(spreadsheet, project_id)
 
         await update.message.reply_text(
             f"✅ Расход записан!\n\n"
             f"🆔 Проект: {project_id}\n"
-            f"📂 Категория: {context.user_data['expense_category']}\n"
-            f"💸 Сумма: ${context.user_data['expense_amount']:,.2f}\n"
-            f"📝 Описание: {description or '—'}\n"
+            f"📂 {context.user_data['expense_category']}: ${context.user_data['expense_amount']:,.2f}\n"
+            f"📝 {description or '—'}\n"
             f"👤 Записал: {user_name}",
             reply_markup=MAIN_MENU_KEYBOARD,
         )
     except Exception as e:
-        logger.error(f"Error recording expense: {e}")
-        await update.message.reply_text(
-            "❌ Ошибка при записи расхода.",
-            reply_markup=MAIN_MENU_KEYBOARD,
-        )
+        logger.error(f"Error: {e}")
+        await update.message.reply_text("❌ Ошибка.", reply_markup=MAIN_MENU_KEYBOARD)
 
     for key in ["expense_project_id", "expense_category", "expense_amount"]:
         context.user_data.pop(key, None)
@@ -612,12 +706,9 @@ async def status_desc_select_project(update: Update, context) -> int:
     await query.answer()
     if query.data == "cancel":
         return await cancel_callback(update, context)
-
     project_id = query.data.replace("proj_", "")
     context.user_data["desc_project_id"] = project_id
-    await query.edit_message_text(
-        f"📝 Проект {project_id}.\n\nВведи описание текущего состояния:"
-    )
+    await query.edit_message_text(f"📝 Проект {project_id}.\n\nВведи описание текущего состояния:")
     return STATUS_DESC_TEXT
 
 
@@ -642,15 +733,12 @@ async def status_desc_text(update: Update, context) -> int:
             f"✅ Описание добавлено!\n\n"
             f"🆔 Проект: {project_id}\n"
             f"📝 {description}\n"
-            f"👤 Записал: {user_name}",
+            f"👤 {user_name}",
             reply_markup=MAIN_MENU_KEYBOARD,
         )
     except Exception as e:
-        logger.error(f"Error recording update: {e}")
-        await update.message.reply_text(
-            "❌ Ошибка при записи описания.",
-            reply_markup=MAIN_MENU_KEYBOARD,
-        )
+        logger.error(f"Error: {e}")
+        await update.message.reply_text("❌ Ошибка.", reply_markup=MAIN_MENU_KEYBOARD)
 
     context.user_data.pop("desc_project_id", None)
     return MAIN_MENU
@@ -668,14 +756,10 @@ async def change_status_select_project(update: Update, context) -> int:
     await query.answer()
     if query.data == "cancel":
         return await cancel_callback(update, context)
-
     project_id = query.data.replace("proj_", "")
     context.user_data["status_project_id"] = project_id
 
-    buttons = []
-    for status in STATUS_OPTIONS:
-        buttons.append([InlineKeyboardButton(status, callback_data=f"status_{status}")])
-
+    buttons = [[InlineKeyboardButton(s, callback_data=f"status_{s}")] for s in STATUS_OPTIONS]
     await query.edit_message_text(
         f"🔄 Проект {project_id}.\n\nВыбери новый статус:",
         reply_markup=InlineKeyboardMarkup(buttons),
@@ -693,7 +777,6 @@ async def change_status_value(update: Update, context) -> int:
     try:
         spreadsheet = get_spreadsheet()
         projects_sheet = spreadsheet.worksheet("Проекты")
-
         row_num = find_project_row(projects_sheet, project_id)
         if row_num != -1:
             projects_sheet.update(f"E{row_num}", [[new_status]])
@@ -702,19 +785,16 @@ async def change_status_value(update: Update, context) -> int:
         address = get_project_address(projects_sheet, project_id)
         now = datetime.now().strftime("%Y-%m-%d %H:%M")
         updates_sheet.append_row(
-            [project_id, address, f"Статус изменён → {new_status}", now, user_name],
+            [project_id, address, f"Статус → {new_status}", now, user_name],
             value_input_option="USER_ENTERED"
         )
 
         await query.edit_message_text(
-            f"✅ Статус обновлён!\n\n"
-            f"🆔 Проект: {project_id}\n"
-            f"🔄 Новый статус: {new_status}\n"
-            f"👤 Изменил: {user_name}"
+            f"✅ Статус: {new_status}\n🆔 Проект: {project_id}\n👤 {user_name}"
         )
     except Exception as e:
-        logger.error(f"Error changing status: {e}")
-        await query.edit_message_text("❌ Ошибка при смене статуса.")
+        logger.error(f"Error: {e}")
+        await query.edit_message_text("❌ Ошибка.")
 
     await query.message.reply_text("Главное меню:", reply_markup=MAIN_MENU_KEYBOARD)
     context.user_data.pop("status_project_id", None)
@@ -730,7 +810,6 @@ async def view_status_select_project(update: Update, context) -> int:
     await query.answer()
     if query.data == "cancel":
         return await cancel_callback(update, context)
-
     project_id = query.data.replace("proj_", "")
 
     try:
@@ -757,36 +836,33 @@ async def view_status_select_project(update: Update, context) -> int:
 
         text = (
             f"📊 *Проект {project_id}*\n\n"
-            f"📍 Адрес: {address}\n"
-            f"📝 Описание: {description}\n"
+            f"📍 {address}\n"
+            f"📝 {description}\n"
             f"🔄 Статус: {status}\n\n"
-            f"💵 Цена проекта: ${price:,.2f}\n"
+            f"💵 Цена: ${price:,.2f}\n"
             f"✅ Получено: ${total_paid:,.2f}\n"
             f"💸 Расходы: ${total_expenses:,.2f}\n"
-            f"📈 Остаток от клиента: ${remaining:,.2f}\n"
+            f"📈 Клиент должен: ${remaining:,.2f}\n"
             f"💰 Баланс: ${balance:,.2f}\n"
         )
 
-        # Последние платежи
-        all_payments = payments_sheet.get_all_values()
-        proj_payments = [r for r in all_payments[1:] if r[0] == project_id]
+        # Платежи
+        proj_payments = [r for r in payments_sheet.get_all_values()[1:] if r[0] == project_id]
         if proj_payments:
             text += "\n*Платежи:*\n"
             for p in proj_payments[-5:]:
                 text += f"  • {p[3]} — ${float(p[2]):,.2f} ({p[4]})\n"
 
-        # Последние расходы
-        all_expenses = expenses_sheet.get_all_values()
-        proj_expenses = [r for r in all_expenses[1:] if r[0] == project_id]
+        # Расходы
+        proj_expenses = [r for r in expenses_sheet.get_all_values()[1:] if r[0] == project_id]
         if proj_expenses:
             text += "\n*Расходы:*\n"
             for e in proj_expenses[-5:]:
                 desc = f" — {e[4]}" if e[4] else ""
                 text += f"  • {e[5]} — ${float(e[3]):,.2f} [{e[2]}]{desc} ({e[6]})\n"
 
-        # Последние обновления
-        all_updates = updates_sheet.get_all_values()
-        proj_updates = [r for r in all_updates[1:] if r[0] == project_id]
+        # Обновления
+        proj_updates = [r for r in updates_sheet.get_all_values()[1:] if r[0] == project_id]
         if proj_updates:
             text += "\n*Обновления:*\n"
             for u in proj_updates[-5:]:
@@ -795,10 +871,131 @@ async def view_status_select_project(update: Update, context) -> int:
         await query.edit_message_text(text, parse_mode="Markdown")
 
     except Exception as e:
-        logger.error(f"Error viewing status: {e}")
-        await query.edit_message_text("❌ Ошибка при загрузке статуса.")
+        logger.error(f"Error: {e}")
+        await query.edit_message_text("❌ Ошибка.")
 
     await query.message.reply_text("Главное меню:", reply_markup=MAIN_MENU_KEYBOARD)
+    return MAIN_MENU
+
+
+# ============================================================
+# ДОБАВИТЬ САБА
+# ============================================================
+
+async def add_sub_name(update: Update, context) -> int:
+    sub_name = update.message.text.strip()
+    user_name = get_user_name(update)
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+    try:
+        spreadsheet = get_spreadsheet()
+        subs_sheet = spreadsheet.worksheet("Сабы")
+        subs_sheet.append_row(
+            [sub_name, now, user_name],
+            value_input_option="USER_ENTERED"
+        )
+
+        await update.message.reply_text(
+            f"✅ Субподрядчик добавлен!\n\n"
+            f"👷 {sub_name}\n"
+            f"👤 Добавил: {user_name}",
+            reply_markup=MAIN_MENU_KEYBOARD,
+        )
+    except Exception as e:
+        logger.error(f"Error adding sub: {e}")
+        await update.message.reply_text("❌ Ошибка.", reply_markup=MAIN_MENU_KEYBOARD)
+
+    return MAIN_MENU
+
+
+# ============================================================
+# ОПЛАТА САБУ
+# ============================================================
+
+async def show_subs_list(update: Update, context) -> int:
+    try:
+        spreadsheet = get_spreadsheet()
+        subs = get_subs_list(spreadsheet)
+    except Exception as e:
+        logger.error(f"Error: {e}")
+        await update.message.reply_text("❌ Ошибка.", reply_markup=MAIN_MENU_KEYBOARD)
+        return MAIN_MENU
+
+    if not subs:
+        await update.message.reply_text(
+            "📭 Нет субподрядчиков. Сначала добавь саба.",
+            reply_markup=MAIN_MENU_KEYBOARD,
+        )
+        return MAIN_MENU
+
+    buttons = [[InlineKeyboardButton(s, callback_data=f"sub_{s}")] for s in subs]
+    buttons.append([InlineKeyboardButton("❌ Отмена", callback_data="cancel")])
+
+    await update.message.reply_text(
+        "👷 Выбери субподрядчика:",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+    return SUB_PAY_SELECT_SUB
+
+
+async def sub_pay_select_sub(update: Update, context) -> int:
+    query = update.callback_query
+    await query.answer()
+    if query.data == "cancel":
+        return await cancel_callback(update, context)
+
+    sub_name = query.data.replace("sub_", "")
+    context.user_data["sub_pay_name"] = sub_name
+    await query.edit_message_text(f"💵 Оплата: {sub_name}\n\nВведи сумму:")
+    return SUB_PAY_AMOUNT
+
+
+async def sub_pay_amount(update: Update, context) -> int:
+    try:
+        amount = float(update.message.text.replace(",", "").replace("$", ""))
+    except ValueError:
+        await update.message.reply_text("❌ Введи число.")
+        return SUB_PAY_AMOUNT
+
+    sub_name = context.user_data["sub_pay_name"]
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    user_name = get_user_name(update)
+
+    try:
+        spreadsheet = get_spreadsheet()
+        zp_sheet = spreadsheet.worksheet("ЗП")
+        zp_sheet.append_row(
+            [sub_name, amount, now, user_name],
+            value_input_option="USER_ENTERED"
+        )
+
+        await update.message.reply_text(
+            f"✅ Оплата записана!\n\n"
+            f"👷 {sub_name}\n"
+            f"💵 Сумма: ${amount:,.2f}\n"
+            f"👤 Записал: {user_name}",
+            reply_markup=MAIN_MENU_KEYBOARD,
+        )
+    except Exception as e:
+        logger.error(f"Error: {e}")
+        await update.message.reply_text("❌ Ошибка.", reply_markup=MAIN_MENU_KEYBOARD)
+
+    context.user_data.pop("sub_pay_name", None)
+    return MAIN_MENU
+
+
+# ============================================================
+# СВОДКА
+# ============================================================
+
+async def show_summary(update: Update, context) -> int:
+    try:
+        spreadsheet = get_spreadsheet()
+        text = build_summary(spreadsheet)
+        await update.message.reply_text(text, parse_mode="Markdown", reply_markup=MAIN_MENU_KEYBOARD)
+    except Exception as e:
+        logger.error(f"Error building summary: {e}")
+        await update.message.reply_text("❌ Ошибка при загрузке сводки.", reply_markup=MAIN_MENU_KEYBOARD)
     return MAIN_MENU
 
 
@@ -807,9 +1004,7 @@ async def view_status_select_project(update: Update, context) -> int:
 # ============================================================
 
 async def cancel(update: Update, context) -> int:
-    await update.message.reply_text(
-        "❌ Действие отменено.", reply_markup=MAIN_MENU_KEYBOARD
-    )
+    await update.message.reply_text("❌ Отменено.", reply_markup=MAIN_MENU_KEYBOARD)
     return MAIN_MENU
 
 
@@ -818,13 +1013,12 @@ async def cancel(update: Update, context) -> int:
 # ============================================================
 
 def main():
-    """Запуск бота."""
     try:
         spreadsheet = get_spreadsheet()
         init_sheets(spreadsheet)
-        logger.info("✅ Листы Google Sheets инициализированы.")
+        logger.info("✅ Листы инициализированы.")
     except Exception as e:
-        logger.error(f"❌ Ошибка инициализации Google Sheets: {e}")
+        logger.error(f"❌ Ошибка инициализации: {e}")
 
     app = Application.builder().token(BOT_TOKEN).build()
 
@@ -881,12 +1075,21 @@ def main():
                 CallbackQueryHandler(view_status_select_project, pattern="^proj_"),
                 CallbackQueryHandler(cancel_callback, pattern="^cancel$"),
             ],
+            ADD_SUB_NAME: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, add_sub_name),
+            ],
+            SUB_PAY_SELECT_SUB: [
+                CallbackQueryHandler(sub_pay_select_sub, pattern="^sub_"),
+                CallbackQueryHandler(cancel_callback, pattern="^cancel$"),
+            ],
+            SUB_PAY_AMOUNT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, sub_pay_amount),
+            ],
         },
         fallbacks=[CommandHandler("cancel", cancel), CommandHandler("start", start)],
     )
 
     app.add_handler(conv_handler)
-
     logger.info("🚀 Бот запущен!")
     app.run_polling()
 
