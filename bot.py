@@ -131,6 +131,9 @@ def init_sheets(spreadsheet):
     get_or_create_sheet(spreadsheet, "ЗП", [
         "Субподрядчик", "Сумма", "Дата", "Кто записал"
     ])
+    get_or_create_sheet(spreadsheet, "Сводка", [
+        "Показатель", "Значение", "Примечание"
+    ])
     return projects
 
 
