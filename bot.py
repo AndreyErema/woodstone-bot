@@ -102,7 +102,13 @@ SCOPES = [
 
 def get_google_creds():
     """Получить credentials для Google API."""
-    creds = Credentials.from_service_account_file(GOOGLE_CREDS_FILE, scopes=SCOPES)
+    creds_json = os.environ.get("GOOGLE_CREDS_JSON", "")
+    if creds_json:
+        import json
+        creds_info = json.loads(creds_json)
+        creds = Credentials.from_service_account_info(creds_info, scopes=SCOPES)
+    else:
+        creds = Credentials.from_service_account_file(GOOGLE_CREDS_FILE, scopes=SCOPES)
     return creds
 
 
