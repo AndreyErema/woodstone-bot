@@ -35,7 +35,7 @@ GOOGLE_CREDS_FILE = os.environ.get("GOOGLE_CREDS_FILE", "credentials.json")
 
 ALLOWED_USERS = {
     76341596: "Jeremy",
-    # 987654321: "Partner 2",
+    139580832: "Serg",
     # 111222333: "Partner 3",
     # 444555666: "Partner 4",
 }
