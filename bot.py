@@ -88,7 +88,6 @@ logger = logging.getLogger(__name__)
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
-    "https://www.googleapis.com/auth/cloud-vision",
 ]
 
 
@@ -112,11 +111,6 @@ def get_spreadsheet():
 def get_drive_service():
     creds = get_google_creds()
     return build("drive", "v3", credentials=creds)
-
-
-def get_vision_service():
-    creds = get_google_creds()
-    return build("vision", "v1", credentials=creds)
 
 
 def upload_receipt_to_drive(file_path: str) -> str:
@@ -167,66 +161,68 @@ def upload_receipt_to_drive(file_path: str) -> str:
 
 
 def extract_total_from_receipt(file_path: str) -> float:
-    """Распознать текст с фото чека и извлечь сумму TOTAL."""
+    """Распознать сумму с фото чека через Claude API."""
     try:
-        service = get_vision_service()
+        import urllib.request
 
-        with open(file_path, "rb") as f:
-            content = base64.b64encode(f.read()).decode("utf-8")
-
-        body = {
-            "requests": [{
-                "image": {"content": content},
-                "features": [{"type": "TEXT_DETECTION"}],
-            }]
-        }
-
-        response = service.images().annotate(body=body).execute()
-        texts = response.get("responses", [{}])[0]
-        full_text = texts.get("fullTextAnnotation", {}).get("text", "")
-
-        if not full_text:
+        ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+        if not ANTHROPIC_API_KEY:
+            logger.error("ANTHROPIC_API_KEY not set")
             return 0.0
 
-        logger.info(f"OCR text: {full_text[:500]}")
+        with open(file_path, "rb") as f:
+            image_data = base64.b64encode(f.read()).decode("utf-8")
 
-        # Ищем сумму — паттерны для американских чеков
-        lines = full_text.upper().split("\n")
-        total = 0.0
+        request_body = json.dumps({
+            "model": "claude-sonnet-4-20250514",
+            "max_tokens": 100,
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/jpeg",
+                            "data": image_data,
+                        },
+                    },
+                    {
+                        "type": "text",
+                        "text": "This is a photo of a receipt. Find the TOTAL amount (the final amount paid, not subtotal, not tax). Return ONLY the number, nothing else. Example: 2004.14"
+                    }
+                ],
+            }],
+        })
 
-        for line in lines:
-            # Ищем строки с TOTAL, GRAND TOTAL, AMOUNT DUE, BALANCE DUE
-            if any(keyword in line for keyword in ["TOTAL", "AMOUNT DUE", "BALANCE DUE", "AMOUNT", "DUE"]):
-                # Пропускаем SUB TOTAL, SUBTOTAL
-                if "SUB" in line or "TAX" in line:
-                    continue
-                # Извлекаем число
-                numbers = re.findall(r'\$?\d+[.,]\d{2}', line)
-                if numbers:
-                    num_str = numbers[-1].replace("$", "").replace(",", "")
-                    try:
-                        candidate = float(num_str)
-                        if candidate > total:
-                            total = candidate
-                    except ValueError:
-                        continue
+        req = urllib.request.Request(
+            "https://api.anthropic.com/v1/messages",
+            data=request_body.encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "x-api-key": ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01",
+            },
+        )
 
-        # Если не нашли по ключевым словам — берём последнее большое число
-        if total == 0.0:
-            all_numbers = re.findall(r'\$?\d+[.,]\d{2}', full_text)
-            for num_str in reversed(all_numbers):
-                try:
-                    candidate = float(num_str.replace("$", "").replace(",", ""))
-                    if candidate > 0:
-                        total = candidate
-                        break
-                except ValueError:
-                    continue
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            result = json.loads(resp.read().decode("utf-8"))
 
+        # Извлечь текст ответа
+        answer = ""
+        for block in result.get("content", []):
+            if block.get("type") == "text":
+                answer += block.get("text", "")
+
+        logger.info(f"Claude receipt answer: {answer}")
+
+        # Парсим число
+        answer = answer.strip().replace("$", "").replace(",", "")
+        total = float(answer)
         return total
 
     except Exception as e:
-        logger.error(f"Vision API error: {e}")
+        logger.error(f"Receipt OCR error: {e}")
         return 0.0
 
 
