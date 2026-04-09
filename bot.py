@@ -357,7 +357,6 @@ def build_summary(spreadsheet) -> str:
     text += f"📈 Клиенты должны: ${clients_owe:,.2f}\n"
     text += f"💰 Баланс (получено - расходы - ЗП): ${balance:,.2f}\n"
 
-  
     if expenses_by_category:
         text += "\n*Все расходы по категориям:*\n"
         for cat, amt in sorted(expenses_by_category.items()):
@@ -369,6 +368,142 @@ def build_summary(spreadsheet) -> str:
             text += f"  • {sub}: ${amt:,.2f}\n"
 
     return text
+
+
+def update_summary_sheet(spreadsheet):
+    """Обновить лист Сводка в таблице."""
+    try:
+        now = datetime.now()
+        week_ago = now - timedelta(days=7)
+        week_ago_str = week_ago.strftime("%Y-%m-%d")
+
+        # --- Данные проектов ---
+        projects_sheet = spreadsheet.worksheet("Проекты")
+        all_projects = projects_sheet.get_all_values()
+        total_price = 0
+        total_received = 0
+        total_expenses_all = 0
+        active_count = 0
+        completed_count = 0
+        for row in all_projects[1:]:
+            try:
+                price = float(row[3]) if row[3] else 0
+                received = float(row[5]) if len(row) > 5 and row[5] else 0
+                expenses = float(row[6]) if len(row) > 6 and row[6] else 0
+                status = row[4] if len(row) > 4 else ""
+                total_price += price
+                total_received += received
+                total_expenses_all += expenses
+                if status == "Завершён":
+                    completed_count += 1
+                else:
+                    active_count += 1
+            except (ValueError, IndexError):
+                continue
+        clients_owe = total_price - total_received
+
+        # --- Платежи за неделю ---
+        payments_sheet = spreadsheet.worksheet("Платежи")
+        week_payments = 0
+        for row in payments_sheet.get_all_values()[1:]:
+            try:
+                date_str = row[3][:10] if len(row) > 3 else ""
+                if date_str >= week_ago_str:
+                    week_payments += float(row[2])
+            except (ValueError, IndexError):
+                continue
+
+        # --- Расходы по категориям ---
+        expenses_sheet = spreadsheet.worksheet("Расходы")
+        expenses_by_category = {}
+        week_expenses = 0
+        week_expenses_by_category = {}
+        for row in expenses_sheet.get_all_values()[1:]:
+            try:
+                category = row[2] if len(row) > 2 else "Прочее"
+                amount = float(row[3]) if len(row) > 3 else 0
+                date_str = row[5][:10] if len(row) > 5 else ""
+                expenses_by_category[category] = expenses_by_category.get(category, 0) + amount
+                if date_str >= week_ago_str:
+                    week_expenses += amount
+                    week_expenses_by_category[category] = week_expenses_by_category.get(category, 0) + amount
+            except (ValueError, IndexError):
+                continue
+
+        # --- ЗП ---
+        zp_sheet = spreadsheet.worksheet("ЗП")
+        total_zp = 0
+        week_zp = 0
+        zp_by_sub = {}
+        for row in zp_sheet.get_all_values()[1:]:
+            try:
+                sub_name = row[0] if row[0] else "?"
+                amount = float(row[1]) if len(row) > 1 else 0
+                date_str = row[2][:10] if len(row) > 2 else ""
+                total_zp += amount
+                zp_by_sub[sub_name] = zp_by_sub.get(sub_name, 0) + amount
+                if date_str >= week_ago_str:
+                    week_zp += amount
+            except (ValueError, IndexError):
+                continue
+
+        balance = total_received - total_expenses_all - total_zp
+
+        # --- Записать в лист Сводка ---
+        try:
+            summary_sheet = spreadsheet.worksheet("Сводка")
+            summary_sheet.clear()
+        except gspread.exceptions.WorksheetNotFound:
+            summary_sheet = spreadsheet.add_worksheet(title="Сводка", rows=50, cols=3)
+
+        rows = [
+            ["СВОДКА", "", f"Обновлено: {now.strftime('%Y-%m-%d %H:%M')}"],
+            ["", "", ""],
+            ["--- ЗА НЕДЕЛЮ ---", f"{week_ago.strftime('%m/%d')} — {now.strftime('%m/%d')}", ""],
+            ["Получено от клиентов", week_payments, ""],
+            ["Расходы по проектам", week_expenses, ""],
+            ["ЗП сабам", week_zp, ""],
+            ["", "", ""],
+        ]
+
+        # Расходы за неделю по категориям
+        if week_expenses_by_category:
+            rows.append(["Расходы за неделю по категориям:", "", ""])
+            for cat, amt in sorted(week_expenses_by_category.items()):
+                rows.append([f"  {cat}", amt, ""])
+            rows.append(["", "", ""])
+
+        rows.extend([
+            ["--- ВСЕГО ---", "", ""],
+            ["Активных проектов", active_count, ""],
+            ["Завершённых проектов", completed_count, ""],
+            ["Общая стоимость проектов", total_price, ""],
+            ["Получено от клиентов", total_received, ""],
+            ["Расходы по проектам", total_expenses_all, ""],
+            ["ЗП сабам (всего)", total_zp, ""],
+            ["Клиенты должны", clients_owe, ""],
+            ["БАЛАНС (получено - расходы - ЗП)", balance, ""],
+            ["", "", ""],
+        ])
+
+        # Все расходы по категориям
+        if expenses_by_category:
+            rows.append(["Все расходы по категориям:", "", ""])
+            for cat, amt in sorted(expenses_by_category.items()):
+                rows.append([f"  {cat}", amt, ""])
+            rows.append(["", "", ""])
+
+        # ЗП по сабам
+        if zp_by_sub:
+            rows.append(["ЗП по субподрядчикам:", "", ""])
+            for sub, amt in sorted(zp_by_sub.items()):
+                rows.append([f"  {sub}", amt, ""])
+
+        summary_sheet.update(f"A1:C{len(rows)}", rows, value_input_option="USER_ENTERED")
+
+        logger.info("✅ Лист Сводка обновлён.")
+    except Exception as e:
+        logger.error(f"Error updating summary sheet: {e}")
 
 
 # ============================================================
@@ -604,6 +739,7 @@ async def payment_amount(update: Update, context) -> int:
             value_input_option="USER_ENTERED"
         )
         update_project_totals(spreadsheet, project_id)
+        update_summary_sheet(spreadsheet)
 
         await update.message.reply_text(
             f"✅ Платёж записан!\n\n"
@@ -680,6 +816,7 @@ async def expense_description(update: Update, context) -> int:
             value_input_option="USER_ENTERED"
         )
         update_project_totals(spreadsheet, project_id)
+        update_summary_sheet(spreadsheet)
 
         await update.message.reply_text(
             f"✅ Расход записан!\n\n"
@@ -969,6 +1106,7 @@ async def sub_pay_amount(update: Update, context) -> int:
             [sub_name, amount, now, user_name],
             value_input_option="USER_ENTERED"
         )
+        update_summary_sheet(spreadsheet)
 
         await update.message.reply_text(
             f"✅ Оплата записана!\n\n"
