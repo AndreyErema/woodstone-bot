@@ -24,6 +24,10 @@ from telegram.ext import (
 )
 import gspread
 from google.oauth2.service_account import Credentials
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaFileUpload
+import base64
+import re
 
 # ============================================================
 # НАСТРОЙКИ
@@ -31,11 +35,12 @@ from google.oauth2.service_account import Credentials
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
 SPREADSHEET_ID = os.environ.get("SPREADSHEET_ID", "YOUR_SPREADSHEET_ID_HERE")
+DRIVE_FOLDER_ID = os.environ.get("DRIVE_FOLDER_ID", "YOUR_DRIVE_FOLDER_ID_HERE")
 GOOGLE_CREDS_FILE = os.environ.get("GOOGLE_CREDS_FILE", "credentials.json")
 
 ALLOWED_USERS = {
     76341596: "Jeremy",
-    139580832: "Serg",
+    # 987654321: "Partner 2",
     # 111222333: "Partner 3",
     # 444555666: "Partner 4",
 }
@@ -71,7 +76,10 @@ logger = logging.getLogger(__name__)
     ADD_SUB_NAME,
     SUB_PAY_SELECT_SUB,
     SUB_PAY_AMOUNT,
-) = range(18)
+    RECEIPT_SELECT_PROJECT,
+    RECEIPT_PHOTO,
+    RECEIPT_CONFIRM,
+) = range(21)
 
 # ============================================================
 # GOOGLE SHEETS — ПОДКЛЮЧЕНИЕ
@@ -98,6 +106,127 @@ def get_spreadsheet():
     client = gspread.authorize(creds)
     spreadsheet = client.open_by_key(SPREADSHEET_ID)
     return spreadsheet
+
+
+def get_drive_service():
+    creds = get_google_creds()
+    return build("drive", "v3", credentials=creds)
+
+
+def get_vision_service():
+    creds = get_google_creds()
+    return build("vision", "v1", credentials=creds)
+
+
+def upload_receipt_to_drive(file_path: str) -> str:
+    """Загрузить фото чека в Google Drive в папку Чеки/YYYY-MM."""
+    service = get_drive_service()
+    now = datetime.now()
+    month_folder_name = f"Чеки {now.strftime('%Y-%m')}"
+
+    # Найти или создать папку месяца
+    query = (
+        f"name='{month_folder_name}' and "
+        f"'{DRIVE_FOLDER_ID}' in parents and "
+        f"mimeType='application/vnd.google-apps.folder' and "
+        f"trashed=false"
+    )
+    results = service.files().list(q=query, fields="files(id)").execute()
+    folders = results.get("files", [])
+
+    if folders:
+        folder_id = folders[0]["id"]
+    else:
+        folder_metadata = {
+            "name": month_folder_name,
+            "mimeType": "application/vnd.google-apps.folder",
+            "parents": [DRIVE_FOLDER_ID],
+        }
+        folder = service.files().create(body=folder_metadata, fields="id").execute()
+        folder_id = folder["id"]
+
+    # Загрузить фото
+    timestamp = now.strftime("%Y%m%d_%H%M%S")
+    file_metadata = {
+        "name": f"receipt_{timestamp}.jpg",
+        "parents": [folder_id],
+    }
+    media = MediaFileUpload(file_path, mimetype="image/jpeg")
+    uploaded = service.files().create(
+        body=file_metadata, media_body=media, fields="id, webViewLink"
+    ).execute()
+
+    # Сделать доступным по ссылке
+    service.permissions().create(
+        fileId=uploaded["id"],
+        body={"type": "anyone", "role": "reader"},
+    ).execute()
+
+    return uploaded.get("webViewLink", "")
+
+
+def extract_total_from_receipt(file_path: str) -> float:
+    """Распознать текст с фото чека и извлечь сумму TOTAL."""
+    try:
+        service = get_vision_service()
+
+        with open(file_path, "rb") as f:
+            content = base64.b64encode(f.read()).decode("utf-8")
+
+        body = {
+            "requests": [{
+                "image": {"content": content},
+                "features": [{"type": "TEXT_DETECTION"}],
+            }]
+        }
+
+        response = service.images().annotate(body=body).execute()
+        texts = response.get("responses", [{}])[0]
+        full_text = texts.get("fullTextAnnotation", {}).get("text", "")
+
+        if not full_text:
+            return 0.0
+
+        logger.info(f"OCR text: {full_text[:500]}")
+
+        # Ищем сумму — паттерны для американских чеков
+        lines = full_text.upper().split("\n")
+        total = 0.0
+
+        for line in lines:
+            # Ищем строки с TOTAL, GRAND TOTAL, AMOUNT DUE, BALANCE DUE
+            if any(keyword in line for keyword in ["TOTAL", "AMOUNT DUE", "BALANCE DUE", "AMOUNT", "DUE"]):
+                # Пропускаем SUB TOTAL, SUBTOTAL
+                if "SUB" in line or "TAX" in line:
+                    continue
+                # Извлекаем число
+                numbers = re.findall(r'\$?\d+[.,]\d{2}', line)
+                if numbers:
+                    num_str = numbers[-1].replace("$", "").replace(",", "")
+                    try:
+                        candidate = float(num_str)
+                        if candidate > total:
+                            total = candidate
+                    except ValueError:
+                        continue
+
+        # Если не нашли по ключевым словам — берём последнее большое число
+        if total == 0.0:
+            all_numbers = re.findall(r'\$?\d+[.,]\d{2}', full_text)
+            for num_str in reversed(all_numbers):
+                try:
+                    candidate = float(num_str.replace("$", "").replace(",", ""))
+                    if candidate > 0:
+                        total = candidate
+                        break
+                except ValueError:
+                    continue
+
+        return total
+
+    except Exception as e:
+        logger.error(f"Vision API error: {e}")
+        return 0.0
 
 
 def get_or_create_sheet(spreadsheet, title, headers):
@@ -662,10 +791,11 @@ def update_summary_sheet(spreadsheet):
 MAIN_MENU_KEYBOARD = ReplyKeyboardMarkup(
     [
         ["📋 Новый проект", "💰 Записать платёж"],
-        ["💸 Записать расход", "📝 Добавить описание"],
-        ["🔄 Изменить статус", "📊 Статус проекта"],
+        ["💸 Записать расход", "🧾 Скан чека"],
+        ["📝 Добавить описание", "🔄 Изменить статус"],
+        ["📊 Статус проекта", "📈 Сводка"],
         ["👷 Добавить саба", "💵 Оплата сабу"],
-        ["📈 Сводка", "📁 Архив"],
+        ["📁 Архив"],
     ],
     resize_keyboard=True,
 )
@@ -705,6 +835,9 @@ async def main_menu_handler(update: Update, context) -> int:
 
     elif text == "💸 Записать расход":
         return await show_project_list(update, context, EXPENSE_SELECT_PROJECT)
+
+    elif text == "🧾 Скан чека":
+        return await show_project_list(update, context, RECEIPT_SELECT_PROJECT)
 
     elif text == "📝 Добавить описание":
         return await show_project_list(update, context, STATUS_DESC_SELECT_PROJECT)
@@ -1273,6 +1406,204 @@ async def sub_pay_amount(update: Update, context) -> int:
 
 
 # ============================================================
+# СКАН ЧЕКА
+# ============================================================
+
+async def receipt_select_project(update: Update, context) -> int:
+    query = update.callback_query
+    await query.answer()
+    if query.data == "cancel":
+        return await cancel_callback(update, context)
+    project_id = query.data.replace("proj_", "")
+    context.user_data["receipt_project_id"] = project_id
+    await query.edit_message_text(
+        f"🧾 Проект {project_id}.\n\n📸 Сфоткай чек и отправь фото:"
+    )
+    return RECEIPT_PHOTO
+
+
+async def receipt_photo(update: Update, context) -> int:
+    if not update.message.photo:
+        await update.message.reply_text("❌ Отправь фото, не файл.")
+        return RECEIPT_PHOTO
+
+    await update.message.reply_text("⏳ Сканирую чек...")
+
+    # Скачать фото
+    photo = update.message.photo[-1]
+    file = await context.bot.get_file(photo.file_id)
+    file_path = f"/tmp/receipt_{photo.file_id}.jpg"
+    await file.download_to_drive(file_path)
+
+    # Распознать сумму
+    total = extract_total_from_receipt(file_path)
+    context.user_data["receipt_file_path"] = file_path
+    context.user_data["receipt_amount"] = total
+
+    if total > 0:
+        buttons = [
+            [InlineKeyboardButton(f"✅ Да, ${total:,.2f}", callback_data="receipt_yes")],
+            [InlineKeyboardButton("✏️ Ввести вручную", callback_data="receipt_manual")],
+            [InlineKeyboardButton("❌ Отмена", callback_data="cancel")],
+        ]
+        await update.message.reply_text(
+            f"🧾 Распознанная сумма: **${total:,.2f}**\n\nВерно?",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+    else:
+        buttons = [
+            [InlineKeyboardButton("✏️ Ввести вручную", callback_data="receipt_manual")],
+            [InlineKeyboardButton("❌ Отмена", callback_data="cancel")],
+        ]
+        await update.message.reply_text(
+            "🧾 Не удалось распознать сумму.\n\nВведи вручную:",
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+    return RECEIPT_CONFIRM
+
+
+async def receipt_confirm(update: Update, context) -> int:
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "cancel":
+        # Удалить temp файл
+        try:
+            os.remove(context.user_data.get("receipt_file_path", ""))
+        except OSError:
+            pass
+        return await cancel_callback(update, context)
+
+    if query.data == "receipt_manual":
+        await query.edit_message_text("✏️ Введи сумму вручную:")
+        return RECEIPT_CONFIRM
+
+    if query.data == "receipt_yes":
+        amount = context.user_data.get("receipt_amount", 0)
+        return await save_receipt(query, context, amount)
+
+    # Если пришло число (ручной ввод) — это не callback, обработаем ниже
+    return RECEIPT_CONFIRM
+
+
+async def receipt_manual_amount(update: Update, context) -> int:
+    """Ручной ввод суммы после неудачного OCR."""
+    try:
+        amount = float(update.message.text.replace(",", "").replace("$", ""))
+    except ValueError:
+        await update.message.reply_text("❌ Введи число. Например: 127.45")
+        return RECEIPT_CONFIRM
+
+    return await save_receipt_from_message(update, context, amount)
+
+
+async def save_receipt(query, context, amount):
+    """Сохранить чек (из callback)."""
+    project_id = context.user_data.get("receipt_project_id", "")
+    file_path = context.user_data.get("receipt_file_path", "")
+    user_name = get_user_name_by_id(query.from_user.id)
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+    try:
+        spreadsheet = get_spreadsheet()
+        projects_sheet = spreadsheet.worksheet("Проекты")
+        expenses_sheet = spreadsheet.worksheet("Расходы")
+        address = get_project_address(projects_sheet, project_id)
+
+        # Загрузить фото в Drive
+        drive_link = ""
+        try:
+            drive_link = upload_receipt_to_drive(file_path)
+        except Exception as e:
+            logger.error(f"Drive upload error: {e}")
+            drive_link = "Ошибка загрузки"
+
+        # Записать расход
+        description = f"Чек: {drive_link}" if drive_link else "Чек (фото не загружено)"
+        expenses_sheet.append_row(
+            [project_id, address, "Материалы", amount, description, now, user_name],
+            value_input_option="USER_ENTERED"
+        )
+        update_project_totals(spreadsheet, project_id)
+        update_summary_sheet(spreadsheet)
+
+        await query.edit_message_text(
+            f"✅ Чек записан!\n\n"
+            f"🆔 Проект: {project_id}\n"
+            f"💵 Сумма: ${amount:,.2f}\n"
+            f"📂 Категория: Материалы\n"
+            f"🔗 Фото: {drive_link or '—'}\n"
+            f"👤 Записал: {user_name}"
+        )
+    except Exception as e:
+        logger.error(f"Error saving receipt: {e}")
+        await query.edit_message_text("❌ Ошибка при сохранении чека.")
+
+    # Cleanup
+    try:
+        os.remove(file_path)
+    except OSError:
+        pass
+    for key in ["receipt_project_id", "receipt_file_path", "receipt_amount"]:
+        context.user_data.pop(key, None)
+
+    await query.message.reply_text("Главное меню:", reply_markup=MAIN_MENU_KEYBOARD)
+    return MAIN_MENU
+
+
+async def save_receipt_from_message(update, context, amount):
+    """Сохранить чек (из текстового ввода суммы)."""
+    project_id = context.user_data.get("receipt_project_id", "")
+    file_path = context.user_data.get("receipt_file_path", "")
+    user_name = get_user_name(update)
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+    try:
+        spreadsheet = get_spreadsheet()
+        projects_sheet = spreadsheet.worksheet("Проекты")
+        expenses_sheet = spreadsheet.worksheet("Расходы")
+        address = get_project_address(projects_sheet, project_id)
+
+        # Загрузить фото
+        drive_link = ""
+        try:
+            drive_link = upload_receipt_to_drive(file_path)
+        except Exception as e:
+            logger.error(f"Drive upload error: {e}")
+            drive_link = "Ошибка загрузки"
+
+        description = f"Чек: {drive_link}" if drive_link else "Чек (фото не загружено)"
+        expenses_sheet.append_row(
+            [project_id, address, "Материалы", amount, description, now, user_name],
+            value_input_option="USER_ENTERED"
+        )
+        update_project_totals(spreadsheet, project_id)
+        update_summary_sheet(spreadsheet)
+
+        await update.message.reply_text(
+            f"✅ Чек записан!\n\n"
+            f"🆔 Проект: {project_id}\n"
+            f"💵 Сумма: ${amount:,.2f}\n"
+            f"📂 Категория: Материалы\n"
+            f"🔗 Фото: {drive_link or '—'}\n"
+            f"👤 Записал: {user_name}",
+            reply_markup=MAIN_MENU_KEYBOARD,
+        )
+    except Exception as e:
+        logger.error(f"Error: {e}")
+        await update.message.reply_text("❌ Ошибка.", reply_markup=MAIN_MENU_KEYBOARD)
+
+    try:
+        os.remove(file_path)
+    except OSError:
+        pass
+    for key in ["receipt_project_id", "receipt_file_path", "receipt_amount"]:
+        context.user_data.pop(key, None)
+    return MAIN_MENU
+
+
+# ============================================================
 # СВОДКА
 # ============================================================
 
@@ -1372,6 +1703,18 @@ def main():
             ],
             SUB_PAY_AMOUNT: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, sub_pay_amount),
+            ],
+            RECEIPT_SELECT_PROJECT: [
+                CallbackQueryHandler(receipt_select_project, pattern="^proj_"),
+                CallbackQueryHandler(cancel_callback, pattern="^cancel$"),
+            ],
+            RECEIPT_PHOTO: [
+                MessageHandler(filters.PHOTO, receipt_photo),
+            ],
+            RECEIPT_CONFIRM: [
+                CallbackQueryHandler(receipt_confirm, pattern="^receipt_"),
+                CallbackQueryHandler(cancel_callback, pattern="^cancel$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receipt_manual_amount),
             ],
         },
         fallbacks=[CommandHandler("cancel", cancel), CommandHandler("start", start)],
