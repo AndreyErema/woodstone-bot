@@ -119,25 +119,32 @@ def upload_receipt_to_drive(file_path: str) -> str:
     now = datetime.now()
     month_folder_name = f"Чеки {now.strftime('%Y-%m')}"
 
-    # Найти или создать папку месяца
+    # Найти папку месяца внутри основной папки
     query = (
         f"name='{month_folder_name}' and "
         f"'{DRIVE_FOLDER_ID}' in parents and "
         f"mimeType='application/vnd.google-apps.folder' and "
         f"trashed=false"
     )
-    results = service.files().list(q=query, fields="files(id)").execute()
+    results = service.files().list(
+        q=query, fields="files(id)",
+        supportsAllDrives=True, includeItemsFromAllDrives=True
+    ).execute()
     folders = results.get("files", [])
 
     if folders:
         folder_id = folders[0]["id"]
     else:
+        # Создать папку месяца внутри основной папки (владелец = основная папка)
         folder_metadata = {
             "name": month_folder_name,
             "mimeType": "application/vnd.google-apps.folder",
             "parents": [DRIVE_FOLDER_ID],
         }
-        folder = service.files().create(body=folder_metadata, fields="id").execute()
+        folder = service.files().create(
+            body=folder_metadata, fields="id",
+            supportsAllDrives=True
+        ).execute()
         folder_id = folder["id"]
 
     # Загрузить фото
@@ -148,13 +155,15 @@ def upload_receipt_to_drive(file_path: str) -> str:
     }
     media = MediaFileUpload(file_path, mimetype="image/jpeg")
     uploaded = service.files().create(
-        body=file_metadata, media_body=media, fields="id, webViewLink"
+        body=file_metadata, media_body=media, fields="id, webViewLink",
+        supportsAllDrives=True
     ).execute()
 
     # Сделать доступным по ссылке
     service.permissions().create(
         fileId=uploaded["id"],
         body={"type": "anyone", "role": "reader"},
+        supportsAllDrives=True
     ).execute()
 
     return uploaded.get("webViewLink", "")
