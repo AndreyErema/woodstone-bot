@@ -38,10 +38,13 @@ SPREADSHEET_ID = os.environ.get("SPREADSHEET_ID", "YOUR_SPREADSHEET_ID_HERE")
 DRIVE_FOLDER_ID = os.environ.get("DRIVE_FOLDER_ID", "YOUR_DRIVE_FOLDER_ID_HERE")
 GOOGLE_CREDS_FILE = os.environ.get("GOOGLE_CREDS_FILE", "credentials.json")
 
+# Telegram канал для хранения фото чеков
+RECEIPTS_CHANNEL_ID = int(os.environ.get("RECEIPTS_CHANNEL_ID", "-1003389113880"))
+
 ALLOWED_USERS = {
     76341596: "Jeremy",
-    139580832: "Serge",
-    1173624685: "Kastet",
+    # 987654321: "Partner 2",
+    # 111222333: "Partner 3",
     # 444555666: "Partner 4",
 }
 
@@ -111,62 +114,6 @@ def get_spreadsheet():
 def get_drive_service():
     creds = get_google_creds()
     return build("drive", "v3", credentials=creds)
-
-
-def upload_receipt_to_drive(file_path: str) -> str:
-    """Загрузить фото чека в Google Drive в папку Чеки/YYYY-MM."""
-    service = get_drive_service()
-    now = datetime.now()
-    month_folder_name = f"Чеки {now.strftime('%Y-%m')}"
-
-    # Найти папку месяца внутри основной папки
-    query = (
-        f"name='{month_folder_name}' and "
-        f"'{DRIVE_FOLDER_ID}' in parents and "
-        f"mimeType='application/vnd.google-apps.folder' and "
-        f"trashed=false"
-    )
-    results = service.files().list(
-        q=query, fields="files(id)",
-        supportsAllDrives=True, includeItemsFromAllDrives=True
-    ).execute()
-    folders = results.get("files", [])
-
-    if folders:
-        folder_id = folders[0]["id"]
-    else:
-        # Создать папку месяца внутри основной папки (владелец = основная папка)
-        folder_metadata = {
-            "name": month_folder_name,
-            "mimeType": "application/vnd.google-apps.folder",
-            "parents": [DRIVE_FOLDER_ID],
-        }
-        folder = service.files().create(
-            body=folder_metadata, fields="id",
-            supportsAllDrives=True
-        ).execute()
-        folder_id = folder["id"]
-
-    # Загрузить фото
-    timestamp = now.strftime("%Y%m%d_%H%M%S")
-    file_metadata = {
-        "name": f"receipt_{timestamp}.jpg",
-        "parents": [folder_id],
-    }
-    media = MediaFileUpload(file_path, mimetype="image/jpeg")
-    uploaded = service.files().create(
-        body=file_metadata, media_body=media, fields="id, webViewLink",
-        supportsAllDrives=True
-    ).execute()
-
-    # Сделать доступным по ссылке
-    service.permissions().create(
-        fileId=uploaded["id"],
-        body={"type": "anyone", "role": "reader"},
-        supportsAllDrives=True
-    ).execute()
-
-    return uploaded.get("webViewLink", "")
 
 
 def extract_total_from_receipt(file_path: str) -> float:
@@ -1441,6 +1388,10 @@ async def receipt_photo(update: Update, context) -> int:
     file_path = f"/tmp/receipt_{photo.file_id}.jpg"
     await file.download_to_drive(file_path)
 
+    # Сохранить file_id для получения ссылки на фото
+    context.user_data["receipt_file_id"] = photo.file_id
+    context.user_data["receipt_telegram_link"] = file.file_path
+
     # Распознать сумму
     total = extract_total_from_receipt(file_path)
     context.user_data["receipt_file_path"] = file_path
@@ -1508,6 +1459,7 @@ async def save_receipt(query, context, amount):
     """Сохранить чек (из callback)."""
     project_id = context.user_data.get("receipt_project_id", "")
     file_path = context.user_data.get("receipt_file_path", "")
+    file_id = context.user_data.get("receipt_file_id", "")
     user_name = get_user_name_by_id(query.from_user.id)
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
 
@@ -1517,16 +1469,28 @@ async def save_receipt(query, context, amount):
         expenses_sheet = spreadsheet.worksheet("Расходы")
         address = get_project_address(projects_sheet, project_id)
 
-        # Загрузить фото в Drive
-        drive_link = ""
+        # Отправить фото в канал чеков
+        photo_link = ""
         try:
-            drive_link = upload_receipt_to_drive(file_path)
+            caption = (
+                f"🧾 Проект: {project_id} — {address}\n"
+                f"💵 Сумма: ${amount:,.2f}\n"
+                f"📅 {now}\n"
+                f"👤 {user_name}"
+            )
+            msg = await context.bot.send_photo(
+                chat_id=RECEIPTS_CHANNEL_ID,
+                photo=file_id,
+                caption=caption,
+            )
+            # Ссылка на сообщение в канале
+            if msg and msg.message_id:
+                channel_id_str = str(RECEIPTS_CHANNEL_ID).replace("-100", "")
+                photo_link = f"https://t.me/c/{channel_id_str}/{msg.message_id}"
         except Exception as e:
-            logger.error(f"Drive upload error: {e}")
-            drive_link = "Ошибка загрузки"
+            logger.error(f"Channel send error: {e}")
 
-        # Записать расход
-        description = f"Чек: {drive_link}" if drive_link else "Чек (фото не загружено)"
+        description = f"Чек: {photo_link}" if photo_link else "Чек"
         expenses_sheet.append_row(
             [project_id, address, "Материалы", amount, description, now, user_name],
             value_input_option="USER_ENTERED"
@@ -1539,7 +1503,7 @@ async def save_receipt(query, context, amount):
             f"🆔 Проект: {project_id}\n"
             f"💵 Сумма: ${amount:,.2f}\n"
             f"📂 Категория: Материалы\n"
-            f"🔗 Фото: {drive_link or '—'}\n"
+            f"🔗 Фото: {'сохранено в канал' if photo_link else 'ошибка'}\n"
             f"👤 Записал: {user_name}"
         )
     except Exception as e:
@@ -1551,7 +1515,7 @@ async def save_receipt(query, context, amount):
         os.remove(file_path)
     except OSError:
         pass
-    for key in ["receipt_project_id", "receipt_file_path", "receipt_amount"]:
+    for key in ["receipt_project_id", "receipt_file_path", "receipt_amount", "receipt_file_id", "receipt_telegram_link"]:
         context.user_data.pop(key, None)
 
     await query.message.reply_text("Главное меню:", reply_markup=MAIN_MENU_KEYBOARD)
@@ -1562,6 +1526,7 @@ async def save_receipt_from_message(update, context, amount):
     """Сохранить чек (из текстового ввода суммы)."""
     project_id = context.user_data.get("receipt_project_id", "")
     file_path = context.user_data.get("receipt_file_path", "")
+    file_id = context.user_data.get("receipt_file_id", "")
     user_name = get_user_name(update)
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
 
@@ -1571,15 +1536,27 @@ async def save_receipt_from_message(update, context, amount):
         expenses_sheet = spreadsheet.worksheet("Расходы")
         address = get_project_address(projects_sheet, project_id)
 
-        # Загрузить фото
-        drive_link = ""
+        # Отправить фото в канал
+        photo_link = ""
         try:
-            drive_link = upload_receipt_to_drive(file_path)
+            caption = (
+                f"🧾 Проект: {project_id} — {address}\n"
+                f"💵 Сумма: ${amount:,.2f}\n"
+                f"📅 {now}\n"
+                f"👤 {user_name}"
+            )
+            msg = await context.bot.send_photo(
+                chat_id=RECEIPTS_CHANNEL_ID,
+                photo=file_id,
+                caption=caption,
+            )
+            if msg and msg.message_id:
+                channel_id_str = str(RECEIPTS_CHANNEL_ID).replace("-100", "")
+                photo_link = f"https://t.me/c/{channel_id_str}/{msg.message_id}"
         except Exception as e:
-            logger.error(f"Drive upload error: {e}")
-            drive_link = "Ошибка загрузки"
+            logger.error(f"Channel send error: {e}")
 
-        description = f"Чек: {drive_link}" if drive_link else "Чек (фото не загружено)"
+        description = f"Чек: {photo_link}" if photo_link else "Чек"
         expenses_sheet.append_row(
             [project_id, address, "Материалы", amount, description, now, user_name],
             value_input_option="USER_ENTERED"
@@ -1592,7 +1569,7 @@ async def save_receipt_from_message(update, context, amount):
             f"🆔 Проект: {project_id}\n"
             f"💵 Сумма: ${amount:,.2f}\n"
             f"📂 Категория: Материалы\n"
-            f"🔗 Фото: {drive_link or '—'}\n"
+            f"🔗 Фото: {'сохранено в канал' if photo_link else 'ошибка'}\n"
             f"👤 Записал: {user_name}",
             reply_markup=MAIN_MENU_KEYBOARD,
         )
@@ -1604,7 +1581,7 @@ async def save_receipt_from_message(update, context, amount):
         os.remove(file_path)
     except OSError:
         pass
-    for key in ["receipt_project_id", "receipt_file_path", "receipt_amount"]:
+    for key in ["receipt_project_id", "receipt_file_path", "receipt_amount", "receipt_file_id", "receipt_telegram_link"]:
         context.user_data.pop(key, None)
     return MAIN_MENU
 
