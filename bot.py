@@ -82,7 +82,10 @@ logger = logging.getLogger(__name__)
     RECEIPT_SELECT_PROJECT,
     RECEIPT_PHOTO,
     RECEIPT_CONFIRM,
-) = range(21)
+    INVOICE_SELECT_PROJECT,
+    INVOICE_PHOTO,
+    INVOICE_CONFIRM,
+) = range(24)
 
 # ============================================================
 # GOOGLE SHEETS — ПОДКЛЮЧЕНИЕ
@@ -179,6 +182,70 @@ def extract_total_from_receipt(file_path: str) -> float:
 
     except Exception as e:
         logger.error(f"Receipt OCR error: {e}")
+        return 0.0
+
+
+def extract_amount_from_invoice(file_path: str) -> float:
+    """Распознать сумму с рукописного инвойса/чека через Claude API."""
+    try:
+        import urllib.request
+
+        ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+        if not ANTHROPIC_API_KEY:
+            logger.error("ANTHROPIC_API_KEY not set")
+            return 0.0
+
+        with open(file_path, "rb") as f:
+            image_data = base64.b64encode(f.read()).decode("utf-8")
+
+        request_body = json.dumps({
+            "model": "claude-sonnet-4-20250514",
+            "max_tokens": 100,
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/jpeg",
+                            "data": image_data,
+                        },
+                    },
+                    {
+                        "type": "text",
+                        "text": "This is a photo of a handwritten invoice, receipt, or check from a client. Find the TOTAL amount paid or due. It may be handwritten. Return ONLY the number, nothing else. Example: 5000.00"
+                    }
+                ],
+            }],
+        })
+
+        req = urllib.request.Request(
+            "https://api.anthropic.com/v1/messages",
+            data=request_body.encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "x-api-key": ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01",
+            },
+        )
+
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            result = json.loads(resp.read().decode("utf-8"))
+
+        answer = ""
+        for block in result.get("content", []):
+            if block.get("type") == "text":
+                answer += block.get("text", "")
+
+        logger.info(f"Claude invoice answer: {answer}")
+
+        answer = answer.strip().replace("$", "").replace(",", "")
+        total = float(answer)
+        return total
+
+    except Exception as e:
+        logger.error(f"Invoice OCR error: {e}")
         return 0.0
 
 
@@ -745,10 +812,10 @@ MAIN_MENU_KEYBOARD = ReplyKeyboardMarkup(
     [
         ["📋 Новый проект", "💰 Записать платёж"],
         ["💸 Записать расход", "🧾 Скан чека"],
-        ["📝 Добавить описание", "🔄 Изменить статус"],
-        ["📊 Статус проекта", "📈 Сводка"],
-        ["👷 Добавить саба", "💵 Оплата сабу"],
-        ["📁 Архив"],
+        ["📄 Скан инвойса", "📝 Добавить описание"],
+        ["🔄 Изменить статус", "📊 Статус проекта"],
+        ["📈 Сводка", "👷 Добавить саба"],
+        ["💵 Оплата сабу", "📁 Архив"],
     ],
     resize_keyboard=True,
 )
@@ -791,6 +858,9 @@ async def main_menu_handler(update: Update, context) -> int:
 
     elif text == "🧾 Скан чека":
         return await show_project_list(update, context, RECEIPT_SELECT_PROJECT)
+
+    elif text == "📄 Скан инвойса":
+        return await show_project_list(update, context, INVOICE_SELECT_PROJECT)
 
     elif text == "📝 Добавить описание":
         return await show_project_list(update, context, STATUS_DESC_SELECT_PROJECT)
@@ -1587,6 +1657,222 @@ async def save_receipt_from_message(update, context, amount):
 
 
 # ============================================================
+# СКАН ИНВОЙСА (рукописный чек от клиента → платёж)
+# ============================================================
+
+async def invoice_select_project(update: Update, context) -> int:
+    query = update.callback_query
+    await query.answer()
+    if query.data == "cancel":
+        return await cancel_callback(update, context)
+    project_id = query.data.replace("proj_", "")
+    context.user_data["invoice_project_id"] = project_id
+    await query.edit_message_text(
+        f"📄 Проект {project_id}.\n\n📸 Сфоткай инвойс/чек от клиента:"
+    )
+    return INVOICE_PHOTO
+
+
+async def invoice_photo(update: Update, context) -> int:
+    if not update.message.photo:
+        await update.message.reply_text("❌ Отправь фото, не файл.")
+        return INVOICE_PHOTO
+
+    await update.message.reply_text("⏳ Читаю инвойс...")
+
+    photo = update.message.photo[-1]
+    file = await context.bot.get_file(photo.file_id)
+    file_path = f"/tmp/invoice_{photo.file_id}.jpg"
+    await file.download_to_drive(file_path)
+
+    context.user_data["invoice_file_id"] = photo.file_id
+    context.user_data["invoice_file_path"] = file_path
+
+    # Распознать сумму через Claude
+    total = extract_amount_from_invoice(file_path)
+    context.user_data["invoice_amount"] = total
+
+    if total > 0:
+        buttons = [
+            [InlineKeyboardButton(f"✅ Да, ${total:,.2f}", callback_data="invoice_yes")],
+            [InlineKeyboardButton("✏️ Ввести вручную", callback_data="invoice_manual")],
+            [InlineKeyboardButton("❌ Отмена", callback_data="cancel")],
+        ]
+        await update.message.reply_text(
+            f"📄 Распознанная сумма: *${total:,.2f}*\n\nВерно?",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+    else:
+        buttons = [
+            [InlineKeyboardButton("✏️ Ввести вручную", callback_data="invoice_manual")],
+            [InlineKeyboardButton("❌ Отмена", callback_data="cancel")],
+        ]
+        await update.message.reply_text(
+            "📄 Не удалось распознать сумму.\n\nВведи вручную:",
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+    return INVOICE_CONFIRM
+
+
+async def invoice_confirm(update: Update, context) -> int:
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "cancel":
+        try:
+            os.remove(context.user_data.get("invoice_file_path", ""))
+        except OSError:
+            pass
+        return await cancel_callback(update, context)
+
+    if query.data == "invoice_manual":
+        await query.edit_message_text("✏️ Введи сумму вручную:")
+        return INVOICE_CONFIRM
+
+    if query.data == "invoice_yes":
+        amount = context.user_data.get("invoice_amount", 0)
+        return await save_invoice(query, context, amount)
+
+    return INVOICE_CONFIRM
+
+
+async def invoice_manual_amount(update: Update, context) -> int:
+    try:
+        amount = float(update.message.text.replace(",", "").replace("$", ""))
+    except ValueError:
+        await update.message.reply_text("❌ Введи число. Например: 5000")
+        return INVOICE_CONFIRM
+    return await save_invoice_from_message(update, context, amount)
+
+
+async def save_invoice(query, context, amount):
+    """Сохранить инвойс как платёж (из callback)."""
+    project_id = context.user_data.get("invoice_project_id", "")
+    file_path = context.user_data.get("invoice_file_path", "")
+    file_id = context.user_data.get("invoice_file_id", "")
+    user_name = get_user_name_by_id(query.from_user.id)
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+    try:
+        spreadsheet = get_spreadsheet()
+        projects_sheet = spreadsheet.worksheet("Проекты")
+        payments_sheet = spreadsheet.worksheet("Платежи")
+        address = get_project_address(projects_sheet, project_id)
+
+        # Отправить фото в канал
+        photo_link = ""
+        try:
+            caption = (
+                f"📄 ИНВОЙС — Проект: {project_id} — {address}\n"
+                f"💰 Платёж: ${amount:,.2f}\n"
+                f"📅 {now}\n"
+                f"👤 {user_name}"
+            )
+            msg = await context.bot.send_photo(
+                chat_id=RECEIPTS_CHANNEL_ID,
+                photo=file_id,
+                caption=caption,
+            )
+            if msg and msg.message_id:
+                channel_id_str = str(RECEIPTS_CHANNEL_ID).replace("-100", "")
+                photo_link = f"https://t.me/c/{channel_id_str}/{msg.message_id}"
+        except Exception as e:
+            logger.error(f"Channel send error: {e}")
+
+        # Записать платёж
+        payments_sheet.append_row(
+            [project_id, address, amount, now, f"{user_name} (инвойс: {photo_link})"],
+            value_input_option="USER_ENTERED"
+        )
+        update_project_totals(spreadsheet, project_id)
+        update_summary_sheet(spreadsheet)
+
+        await query.edit_message_text(
+            f"✅ Инвойс записан как платёж!\n\n"
+            f"🆔 Проект: {project_id}\n"
+            f"💰 Сумма: ${amount:,.2f}\n"
+            f"🔗 Фото: {'сохранено в канал' if photo_link else '—'}\n"
+            f"👤 Записал: {user_name}"
+        )
+    except Exception as e:
+        logger.error(f"Error saving invoice: {e}")
+        await query.edit_message_text("❌ Ошибка при сохранении инвойса.")
+
+    try:
+        os.remove(file_path)
+    except OSError:
+        pass
+    for key in ["invoice_project_id", "invoice_file_path", "invoice_amount", "invoice_file_id"]:
+        context.user_data.pop(key, None)
+
+    await query.message.reply_text("Главное меню:", reply_markup=MAIN_MENU_KEYBOARD)
+    return MAIN_MENU
+
+
+async def save_invoice_from_message(update, context, amount):
+    """Сохранить инвойс как платёж (из ручного ввода)."""
+    project_id = context.user_data.get("invoice_project_id", "")
+    file_path = context.user_data.get("invoice_file_path", "")
+    file_id = context.user_data.get("invoice_file_id", "")
+    user_name = get_user_name(update)
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+    try:
+        spreadsheet = get_spreadsheet()
+        projects_sheet = spreadsheet.worksheet("Проекты")
+        payments_sheet = spreadsheet.worksheet("Платежи")
+        address = get_project_address(projects_sheet, project_id)
+
+        # Отправить фото в канал
+        photo_link = ""
+        try:
+            caption = (
+                f"📄 ИНВОЙС — Проект: {project_id} — {address}\n"
+                f"💰 Платёж: ${amount:,.2f}\n"
+                f"📅 {now}\n"
+                f"👤 {user_name}"
+            )
+            msg = await context.bot.send_photo(
+                chat_id=RECEIPTS_CHANNEL_ID,
+                photo=file_id,
+                caption=caption,
+            )
+            if msg and msg.message_id:
+                channel_id_str = str(RECEIPTS_CHANNEL_ID).replace("-100", "")
+                photo_link = f"https://t.me/c/{channel_id_str}/{msg.message_id}"
+        except Exception as e:
+            logger.error(f"Channel send error: {e}")
+
+        payments_sheet.append_row(
+            [project_id, address, amount, now, f"{user_name} (инвойс: {photo_link})"],
+            value_input_option="USER_ENTERED"
+        )
+        update_project_totals(spreadsheet, project_id)
+        update_summary_sheet(spreadsheet)
+
+        await update.message.reply_text(
+            f"✅ Инвойс записан как платёж!\n\n"
+            f"🆔 Проект: {project_id}\n"
+            f"💰 Сумма: ${amount:,.2f}\n"
+            f"🔗 Фото: {'сохранено в канал' if photo_link else '—'}\n"
+            f"👤 Записал: {user_name}",
+            reply_markup=MAIN_MENU_KEYBOARD,
+        )
+    except Exception as e:
+        logger.error(f"Error: {e}")
+        await update.message.reply_text("❌ Ошибка.", reply_markup=MAIN_MENU_KEYBOARD)
+
+    try:
+        os.remove(file_path)
+    except OSError:
+        pass
+    for key in ["invoice_project_id", "invoice_file_path", "invoice_amount", "invoice_file_id"]:
+        context.user_data.pop(key, None)
+    return MAIN_MENU
+
+
+# ============================================================
 # СВОДКА
 # ============================================================
 
@@ -1698,6 +1984,18 @@ def main():
                 CallbackQueryHandler(receipt_confirm, pattern="^receipt_"),
                 CallbackQueryHandler(cancel_callback, pattern="^cancel$"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, receipt_manual_amount),
+            ],
+            INVOICE_SELECT_PROJECT: [
+                CallbackQueryHandler(invoice_select_project, pattern="^proj_"),
+                CallbackQueryHandler(cancel_callback, pattern="^cancel$"),
+            ],
+            INVOICE_PHOTO: [
+                MessageHandler(filters.PHOTO, invoice_photo),
+            ],
+            INVOICE_CONFIRM: [
+                CallbackQueryHandler(invoice_confirm, pattern="^invoice_"),
+                CallbackQueryHandler(cancel_callback, pattern="^cancel$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, invoice_manual_amount),
             ],
         },
         fallbacks=[CommandHandler("cancel", cancel), CommandHandler("start", start)],
