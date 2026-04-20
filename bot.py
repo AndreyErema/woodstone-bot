@@ -32,6 +32,8 @@ RECEIPTS_CHANNEL_ID = int(os.environ.get("RECEIPTS_CHANNEL_ID", "-1003389113880"
 
 ALLOWED_USERS = {
     76341596: "Jeremy",
+    139580832: "Serge",
+    1173624685: "Kastet",
 }
 
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
