@@ -56,7 +56,7 @@ logger = logging.getLogger(__name__)
     SUB_MENU, SUB_SHIFT_START_SELECT, SUB_SHIFT_END_CONFIRM,
     # Регистрация саба
     SUB_REGISTER_NAME,
-) = range(29)
+) = range(28)
 
 # ============================================================
 # GOOGLE SHEETS
