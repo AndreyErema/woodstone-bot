@@ -32,9 +32,7 @@ RECEIPTS_CHANNEL_ID = int(os.environ.get("RECEIPTS_CHANNEL_ID", "-1003389113880"
 
 # Владельцы (ID: Имя)
 OWNERS = {
-     76341596: "Jeremy",
-    139580832: "Serge",
-    1173624685: "Kastet",
+    76341596: "Jeremy",
 }
 
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
@@ -52,10 +50,9 @@ logger = logging.getLogger(__name__)
     CHANGE_STATUS_SELECT, CHANGE_STATUS_VALUE,
     VIEW_STATUS_SELECT,
     ADD_SUB_NAME, SUB_PAY_SELECT_SUB, SUB_PAY_AMOUNT,
-    # Меню саба
     SUB_MENU, SUB_SHIFT_START_SELECT, SUB_SHIFT_END_CONFIRM,
-    # Регистрация саба
     SUB_REGISTER_NAME,
+    OWNER_SHIFT_START_SELECT,
 ) = range(29)
 
 # ============================================================
@@ -649,8 +646,6 @@ async def sub_shift_start(update, context):
 # ============================================================
 # СМЕНЫ ВЛАДЕЛЬЦА
 # ============================================================
-
-OWNER_SHIFT_START_SELECT = 29  # extra state
 
 async def owner_shift_start(update, context):
     uid = update.effective_user.id
