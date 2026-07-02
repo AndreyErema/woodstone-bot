@@ -28,6 +28,8 @@ def gs(ss, title, headers):
 
 CUSTOMERS_HEADERS = ["Customer ID","Name","Address","phone","email","projects (PO)","Communication","Description","Data","Posted by"]
 
+REMINDERS_HEADERS = ["ID","Date","Time","Assigned To","Description","Project ID","Customer","Status","Created by","Created at","Sent Stages"]
+
 def repair_customers_sheet(ss):
     """Migrate an older Customers sheet (created before the Communication
     column existed) to the current schema, inserting the missing column
@@ -64,6 +66,7 @@ def init(ss):
     gs(ss,"Journal",["Project ID","PO","Description","Data","Posted by"])
     gs(ss,"Customers",CUSTOMERS_HEADERS)
     gs(ss,"Summary",["Metric","Value","Note"])
+    gs(ss,"Reminders",REMINDERS_HEADERS)
     repair_customers_sheet(ss)
 
 # ============================================================
@@ -144,6 +147,41 @@ def active_shift(ss,uid):
                 return {"row":i,"pid":r[3],"po":r[7] if len(r)>7 else "","start":r[4]}
     except: pass
     return None
+
+def next_reminder_id(rs):
+    recs=rs.get_all_values()
+    if len(recs)<=1: return "1"
+    mx=max((int(r[0]) for r in recs[1:] if r and r[0].isdigit()),default=0)
+    return str(mx+1)
+
+def pending_reminders(ss):
+    """All reminders with Status=Pending, as dicts. Row is the 1-based sheet row."""
+    rs=ss.worksheet("Reminders")
+    recs=rs.get_all_values()
+    out=[]
+    for i,r in enumerate(recs[1:],2):
+        if len(r)>7 and r[7]=="Pending":
+            out.append({
+                "row":i,
+                "id":r[0] if len(r)>0 else "",
+                "date":r[1] if len(r)>1 else "",
+                "time":r[2] if len(r)>2 else "",
+                "assigned_to":[n.strip() for n in (r[3] if len(r)>3 else "").split(",") if n.strip()],
+                "description":r[4] if len(r)>4 else "",
+                "project_id":r[5] if len(r)>5 else "",
+                "customer":r[6] if len(r)>6 else "",
+                "status":r[7] if len(r)>7 else "",
+                "created_by":r[8] if len(r)>8 else "",
+                "created_at":r[9] if len(r)>9 else "",
+                "sent_stages":r[10] if len(r)>10 else "",
+            })
+    return out
+
+def find_reminder_row(ss,rid):
+    rs=ss.worksheet("Reminders")
+    for i,r in enumerate(rs.get_all_values()):
+        if r and str(r[0])==str(rid): return i+1
+    return -1
 
 # ============================================================
 # SUMMARY

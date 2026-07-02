@@ -14,6 +14,8 @@ from keyboards import OWNER_KB
 from sheets import get_ss, active_projects, proj_po, update_totals, update_summary_sheet
 from ai import scan_amount
 
+EXPENSE_CATEGORIES = ["Materials", "Subcontractor", "Equipment Rental", "Other"]
+
 async def send_to_channel(ctx, fid, caption):
     if not RECEIPTS_CHANNEL_ID: return ""
     try:
@@ -69,14 +71,32 @@ async def scan_confirm(update, ctx):
         await q.edit_message_text("❌"); await q.message.reply_text("Menu:", reply_markup=OWNER_KB); return OWNER_MENU_ST
     if q.data=="scanc_manual": await q.edit_message_text("✏️ Enter amount:"); return PHOTO_CONFIRM_RECEIPT if ctx.user_data.get("scan_type")=="receipt" else PHOTO_CONFIRM_INVOICE
     if q.data=="scanc_yes":
-        return await save_scan(q, ctx, ctx.user_data.get("scan_amt",0), cb=True)
+        amt=ctx.user_data.get("scan_amt",0)
+        if ctx.user_data.get("scan_type")=="receipt": return await ask_category(q, ctx, amt)
+        return await save_scan(q, ctx, amt, cb=True)
 
 async def scan_manual_amt(update, ctx):
     try: amt=float(update.message.text.replace(",","").replace("$",""))
     except: await update.message.reply_text("❌ Number!"); return PHOTO_CONFIRM_RECEIPT if ctx.user_data.get("scan_type")=="receipt" else PHOTO_CONFIRM_INVOICE
+    if ctx.user_data.get("scan_type")=="receipt": return await ask_category(update, ctx, amt)
     return await save_scan(update, ctx, amt, cb=False)
 
-async def save_scan(src, ctx, amt, cb=True):
+async def ask_category(src, ctx, amt):
+    ctx.user_data["scan_amt_final"]=amt
+    btns=[[InlineKeyboardButton(c,callback_data=f"scancat_{c}")] for c in EXPENSE_CATEGORIES]
+    btns.append([InlineKeyboardButton("❌",callback_data="cancel")])
+    text=f"Amount: ${amt:,.2f}\nКатегория расхода:"
+    if hasattr(src,"edit_message_text"): await src.edit_message_text(text, reply_markup=InlineKeyboardMarkup(btns))
+    else: await src.message.reply_text(text, reply_markup=InlineKeyboardMarkup(btns))
+    return PHOTO_CONFIRM_RECEIPT
+
+async def scan_category_cb(update, ctx):
+    q=update.callback_query; await q.answer()
+    category=q.data.replace("scancat_","")
+    amt=ctx.user_data.get("scan_amt_final",0)
+    return await save_scan(q, ctx, amt, cb=True, category=category)
+
+async def save_scan(src, ctx, amt, cb=True, category="Materials"):
     pid=ctx.user_data.get("scan_pid",""); fid=ctx.user_data.get("scan_fid",""); stype=ctx.user_data.get("scan_type","receipt")
     uid = src.from_user.id if cb else src.effective_user.id
     uname=owner_name(uid); now_s=datetime.now().strftime("%Y-%m-%d %H:%M")
@@ -87,7 +107,7 @@ async def save_scan(src, ctx, amt, cb=True):
             emoji="🧾" if stype=="receipt" else "📄"
             link=await send_to_channel(ctx,fid,f"{emoji} {pid} — {po}\n💵 ${amt:,.2f}\n📅 {now_s}\n👤 {uname}")
         if stype=="receipt":
-            ss.worksheet("Expenses").append_row([pid,po,"Materials",amt,f"Receipt: {link}" if link else "Receipt",now_s,uname], value_input_option="USER_ENTERED")
+            ss.worksheet("Expenses").append_row([pid,po,category,amt,f"Receipt: {link}" if link else "Receipt",now_s,uname], value_input_option="USER_ENTERED")
         else:
             ss.worksheet("Payments").append_row([pid,po,amt,now_s,uname,link], value_input_option="USER_ENTERED")
         update_totals(ss,pid); update_summary_sheet(ss)
@@ -101,5 +121,5 @@ async def save_scan(src, ctx, amt, cb=True):
         else: await src.message.reply_text("❌ Error.", reply_markup=OWNER_KB)
     try:os.remove(ctx.user_data.get("scan_fp",""))
     except:pass
-    for k in ["scan_pid","scan_fp","scan_fid","scan_amt","scan_type"]: ctx.user_data.pop(k,None)
+    for k in ["scan_pid","scan_fp","scan_fid","scan_amt","scan_amt_final","scan_type"]: ctx.user_data.pop(k,None)
     return OWNER_MENU_ST

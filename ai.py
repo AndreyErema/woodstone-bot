@@ -3,6 +3,7 @@ Claude API wrapper: free-text intent parsing and receipt/invoice OCR.
 """
 
 import json, base64, urllib.request
+from datetime import datetime
 
 from config import ANTHROPIC_API_KEY, log
 
@@ -22,12 +23,17 @@ def claude(prompt, image_b64=None, max_tokens=300):
         return "".join(b.get("text","") for b in res.get("content",[]) if b.get("type")=="text")
     except Exception as e: log.error(f"Claude API: {e}"); return ""
 
-def ai_parse(text, projects, subs):
+def ai_parse(text, projects, subs, sender_name="", owners=None):
     """Send user message to Claude, get structured action."""
     proj_list = "\n".join(f"  ID:{p['id']} PO:{p['po']} Address:{p['addr']} Status:{p['status']}" for p in projects) or "  (none)"
     sub_list = "\n".join(f"  {s['name']} rate:${s['rate']}/hr" for s in subs) or "  (none)"
+    owner_list = ", ".join(owners or ([sender_name] if sender_name else []))
 
     prompt = f"""You are a construction project management bot assistant. Parse the user's message and return a JSON action.
+
+TODAY: {datetime.now().strftime("%Y-%m-%d")} ({datetime.now().strftime("%A")})
+MESSAGE SENDER: {sender_name or "unknown"}
+OWNERS (valid names for reminder assignment): {owner_list or "(none)"}
 
 CURRENT PROJECTS:
 {proj_list}
@@ -52,6 +58,8 @@ AVAILABLE ACTIONS (return exactly one):
 - {{"action":"update_customer","name":"customer name to match","field":"phone|email|communication|address","value":"new value"}} (edit one field of an EXISTING customer)
 - {{"action":"scan_receipt"}} (user wants to scan a store receipt - expense)
 - {{"action":"scan_invoice"}} (user wants to scan a client invoice/check - payment)
+- {{"action":"create_reminder","date":"YYYY-MM-DD","time":"HH:MM or empty","assigned_to":["name",...],"description":"...","project_id":"N or empty"}} (user wants to be reminded of something, or wants someone reminded)
+- {{"action":"update_reminder","match":"text fragment identifying which reminder (description/date/who)","field":"date|time|status","value":"new value, or 'Done' or 'Snoozed' for status"}} (user is rescheduling, cancelling, or marking an existing reminder done)
 - {{"action":"unknown","reply":"your helpful response"}}
 
 RULES:
@@ -60,10 +68,12 @@ RULES:
 - create_project "po": if the user did NOT explicitly give a project name/label, derive it from the address as "house number + street or city" (e.g. "102 E 5th Watauga" for "102 E. 5th Avenue, Watauga TN 37694"). NEVER put the type/description of work (e.g. "landscaping and patio") into "po" — that belongs in "description" only.
 - Any phone number in the message (digits, possibly with dashes) that belongs to the client goes into "phone", never into "description" or "po".
 - If user mentions receiving money/check/deposit FROM client → payment. If user mentions spending/buying/purchasing → expense.
+- If the message starts with the word "оплатили" (any case) → always expense (we paid for something), regardless of how the rest of the sentence sounds. Distinguish this from "оплатил клиент"/"получили оплату" and similar phrasing where money comes IN from the client — that's still payment.
 - "закрой проект" or "close project" → status Completed.
 - If the user is correcting/renaming a field of a project or customer that already exists (e.g. "PO пусть будет 671", "смени адрес на ...", "поменяй телефон клиента ..."), use update_project or update_customer — do NOT create a new project/customer for this.
 - Currency: always USD.
 - If the message contains a line starting with "CORRECTION:", it is a correction the user is making to the request right above it. Re-parse the whole thing as ONE corrected action (same action type as before unless the correction clearly changes it).
+- create_reminder: resolve "мне"/"себе"/"me"/"myself" to the MESSAGE SENDER's name. If no recipient is named at all, default to the sender. Only use names from OWNERS for "assigned_to" (match partial/nicknames the same way as subs). A message can name multiple recipients ("напомни мне и Джереми" → both). If no explicit time is given, leave "time" empty (digest-only reminder). Resolve relative dates ("завтра"/"tomorrow", "в понедельник") to an actual YYYY-MM-DD using today's date context if given, otherwise your best guess.
 - If you can't determine the action, return unknown with a helpful reply.
 - Return ONLY valid JSON, no markdown, no explanation.
 

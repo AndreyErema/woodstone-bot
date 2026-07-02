@@ -22,10 +22,11 @@ from sheets import get_ss, init
 from handlers_owner import start, cancel_cmd, owner_handler, free_text_handler, ai_confirm_cb, ai_edit_text, deploy_sheet_cmd
 from handlers_scan import (
     receipt_proj_select, invoice_proj_select, photo_received,
-    scan_confirm, scan_manual_amt,
+    scan_confirm, scan_manual_amt, scan_category_cb,
 )
 from handlers_shifts import oshift_cb
 from handlers_subs import sub_register, approve_sub, sub_handler, sub_shift_cb
+from handlers_reminders import reminders_job, reminder_button_cb
 
 
 def main():
@@ -34,7 +35,10 @@ def main():
 
     app=Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CallbackQueryHandler(approve_sub, pattern="^(approve_|reject_)"))
+    app.add_handler(CallbackQueryHandler(reminder_button_cb, pattern="^(remdone_|remsnooze_)"))
     app.add_handler(CommandHandler("deploy_sheet", deploy_sheet_cmd))
+    if app.job_queue:
+        app.job_queue.run_repeating(reminders_job, interval=1800, first=10)
 
     ch=ConversationHandler(
         entry_points=[CommandHandler("start",start)],
@@ -43,7 +47,7 @@ def main():
             OWNER_FREE_TEXT:[MessageHandler(filters.TEXT & ~filters.COMMAND, free_text_handler)],
             PHOTO_WAIT_RECEIPT:[CallbackQueryHandler(receipt_proj_select,pattern="^proj_"),CallbackQueryHandler(lambda u,c:scan_confirm(u,c),pattern="^cancel$"),MessageHandler(filters.PHOTO,photo_received)],
             PHOTO_WAIT_INVOICE:[CallbackQueryHandler(invoice_proj_select,pattern="^proj_"),CallbackQueryHandler(lambda u,c:scan_confirm(u,c),pattern="^cancel$"),MessageHandler(filters.PHOTO,photo_received)],
-            PHOTO_CONFIRM_RECEIPT:[CallbackQueryHandler(scan_confirm,pattern="^scanc_"),CallbackQueryHandler(scan_confirm,pattern="^cancel$"),MessageHandler(filters.TEXT & ~filters.COMMAND,scan_manual_amt)],
+            PHOTO_CONFIRM_RECEIPT:[CallbackQueryHandler(scan_confirm,pattern="^scanc_"),CallbackQueryHandler(scan_category_cb,pattern="^scancat_"),CallbackQueryHandler(scan_confirm,pattern="^cancel$"),MessageHandler(filters.TEXT & ~filters.COMMAND,scan_manual_amt)],
             PHOTO_CONFIRM_INVOICE:[CallbackQueryHandler(scan_confirm,pattern="^scanc_"),CallbackQueryHandler(scan_confirm,pattern="^cancel$"),MessageHandler(filters.TEXT & ~filters.COMMAND,scan_manual_amt)],
             SUB_MENU_ST:[MessageHandler(filters.TEXT & ~filters.COMMAND,sub_handler)],
             SUB_SHIFT_SELECT:[CallbackQueryHandler(sub_shift_cb,pattern="^sshift_"),CallbackQueryHandler(sub_shift_cb,pattern="^scancel$")],

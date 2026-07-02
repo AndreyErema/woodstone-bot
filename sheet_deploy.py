@@ -52,7 +52,7 @@ def _existing_period(sh):
         return da.strftime("%m/%d/%Y"), db.strftime("%m/%d/%Y")
     return "", ""
 
-TIMESHEET_HEADER_FORMULA = '''=TRANSPOSE(SORT(UNIQUE(FILTER(Shifts!B2:B,(Shifts!A2:A>=TEXT($A$2,"yyyy-mm-dd"))*(Shifts!A2:A<=TEXT($B$2,"yyyy-mm-dd")),Shifts!B2:B<>""))))'''
+TIMESHEET_HEADER_FORMULA = '''=TRANSPOSE(QUERY(Shifts!A2:B1000,"select B where A>='"&TEXT($A$2,"yyyy-mm-dd")&"' and A<='"&TEXT($B$2,"yyyy-mm-dd")&"' and B<>'' group by B label B ''",0))'''
 TIMESHEET_DATES_FORMULA = '''=SEQUENCE($B$2-$A$2+1,1,$A$2,1)'''
 TIMESHEET_GRID_FORMULA = '''=BYROW(A9#,LAMBDA(d,BYCOL(B4#,LAMBDA(s,IF(SUMIFS(Shifts!$G:$G,Shifts!$A:$A,TEXT(d,"yyyy-mm-dd"),Shifts!$B:$B,s)=0,"Выходной",SUMIFS(Shifts!$G:$G,Shifts!$A:$A,TEXT(d,"yyyy-mm-dd"),Shifts!$B:$B,s))))))'''
 TIMESHEET_TOTAL_FORMULA = '''=BYCOL(B9#,LAMBDA(col,SUMIF(col,"<>Выходной")))'''

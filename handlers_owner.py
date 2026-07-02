@@ -6,12 +6,12 @@ are staged and shown to the owner as a preview before anything is written to
 Sheets — see CONFIRM_ACTIONS / describe_action / apply_write_action.
 """
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from telegram import ReplyKeyboardRemove, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ConversationHandler
 
 from config import (
-    log, is_owner, owner_name,
+    log, is_owner, owner_name, OWNERS,
     OWNER_MENU_ST, OWNER_FREE_TEXT, PHOTO_WAIT_RECEIPT, PHOTO_WAIT_INVOICE,
     SUB_MENU_ST, SUB_REGISTER_NAME, AI_CONFIRM_ST, AI_EDIT_ST,
 )
@@ -19,6 +19,7 @@ from keyboards import OWNER_KB, SUB_KB
 from sheets import (
     get_ss, sub_info, next_pid, next_cid, active_projects, all_projects,
     find_proj_row, proj_po, update_totals, approved_subs, update_summary_sheet, build_summary,
+    next_reminder_id, pending_reminders,
 )
 from ai import ai_parse
 from handlers_scan import show_proj_btns
@@ -29,7 +30,7 @@ from sheet_deploy import deploy_all
 CONFIRM_ACTIONS = {
     "create_project", "payment", "expense", "change_status", "journal",
     "pay_sub", "set_rate", "record_hours", "add_customer",
-    "update_project", "update_customer",
+    "update_project", "update_customer", "create_reminder", "update_reminder",
 }
 
 # ============================================================
@@ -71,7 +72,6 @@ async def owner_handler(update, ctx):
     # Button shortcuts
     if t=="📋 New project": await update.message.reply_text("📋 Describe the project in one message:\nExample: Nancy Stalnaker, 102 E 5th Ave Watauga TN, landscaping and patio, 30000", reply_markup=ReplyKeyboardRemove()); return OWNER_FREE_TEXT
     if t=="💰 Payment": await update.message.reply_text("💰 Type: project name/number + amount\nExample: 773 received check 5188", reply_markup=ReplyKeyboardRemove()); return OWNER_FREE_TEXT
-    if t=="💸 Expense": await update.message.reply_text("💸 Type: project + amount + what\nExample: Falling Leaf materials 2300 lumber", reply_markup=ReplyKeyboardRemove()); return OWNER_FREE_TEXT
     if t=="🧾 Scan receipt":
         return await show_proj_btns(update, ctx, PHOTO_WAIT_RECEIPT, "🧾 Select project for receipt:")
     if t=="📄 Scan invoice":
@@ -83,7 +83,7 @@ async def owner_handler(update, ctx):
     if t=="💵 Pay sub": await update.message.reply_text("💵 Type: sub name + amount\nExample: paid Батя 1500", reply_markup=ReplyKeyboardRemove()); return OWNER_FREE_TEXT
     if t=="🟢 Start shift": return await owner_shift_start(update, ctx)
     if t=="🔴 End shift": return await owner_shift_end(update, ctx)
-    if t=="📁 Archive": return await do_archive(update, ctx)
+    if t=="📅 Кто где завтра": return await do_tomorrow(update, ctx)
 
     # Free text → AI parse
     return await process_free_text(update, ctx, t)
@@ -133,6 +133,14 @@ def describe_action(ss, action):
         return f"✏️ *Изменение проекта*\nПроект: {pid} ({po or '?'})\nПоле: {action.get('field')}\nНовое значение: {action.get('value')}"
     if act=="update_customer":
         return f"✏️ *Изменение клиента*\nИмя: {action.get('name')}\nПоле: {action.get('field')}\nНовое значение: {action.get('value')}"
+    if act=="create_reminder":
+        pid=action.get("project_id","")
+        po=proj_po(ss.worksheet("Projects"),pid) if pid else ""
+        who=", ".join(action.get("assigned_to") or []) or "—"
+        return (f"⏰ *Напоминание*\nДата: {action.get('date') or '—'}\nВремя: {action.get('time') or '(без времени, только дайджест)'}\n"
+                f"Кому: {who}\nЧто: {action.get('description') or '—'}\nПроект: {f'{pid} ({po})' if pid else '—'}")
+    if act=="update_reminder":
+        return f"✏️ *Изменение напоминания*\nПоиск: {action.get('match')}\nПоле: {action.get('field')}\nНовое значение: {action.get('value')}"
     return "…"
 
 CONFIRM_BTNS = InlineKeyboardMarkup([
@@ -146,7 +154,8 @@ async def process_free_text(update, ctx, text):
         log.error(f"DB: {e}"); await update.message.reply_text("❌ Database error.", reply_markup=OWNER_KB); return OWNER_MENU_ST
 
     await update.message.reply_text("⏳ Processing...")
-    action=ai_parse(text, projs, subs)
+    sender=owner_name(update.effective_user.id)
+    action=ai_parse(text, projs, subs, sender_name=sender, owners=list(OWNERS.values()))
     act=action.get("action","unknown")
 
     if act in CONFIRM_ACTIONS:
@@ -292,6 +301,27 @@ async def apply_write_action(ss, action, uname, now_s):
                     return f"✅ Customer {name} updated: {field} = {value}"
             return f"❌ Customer '{name}' not found."
 
+        if act=="create_reminder":
+            rs=ss.worksheet("Reminders"); rid=next_reminder_id(rs)
+            date=action.get("date",""); time_=action.get("time",""); who=action.get("assigned_to") or []
+            desc=action.get("description",""); pid=action.get("project_id","")
+            po=proj_po(ss.worksheet("Projects"),pid) if pid else ""
+            rs.append_row([rid,date,time_,", ".join(who),desc,pid,po,"Pending",uname,now_s,""], value_input_option="USER_ENTERED")
+            return f"✅ Напоминание создано!\n📅 {date} {time_}\n👤 {', '.join(who) or '—'}\n📝 {desc}"
+
+        if act=="update_reminder":
+            match=(action.get("match","") or "").lower().strip()
+            field=action.get("field",""); value=action.get("value","")
+            col_map={"date":"B","time":"C","status":"H"}
+            col=col_map.get(field)
+            if not col: return f"❌ Unknown field: {field}"
+            rs=ss.worksheet("Reminders")
+            for i,r in enumerate(rs.get_all_values()[1:],2):
+                if len(r)>7 and r[7]=="Pending" and match and match in (r[4] if len(r)>4 else "").lower():
+                    rs.update(f"{col}{i}",[[value]], value_input_option="USER_ENTERED")
+                    return f"✅ Напоминание обновлено: {field} = {value}"
+            return "❌ Напоминание не найдено."
+
         return "❌ Unknown action."
     except Exception as e:
         log.error(f"Apply action error: {e}")
@@ -333,7 +363,8 @@ async def ai_edit_text(update, ctx):
 
     await update.message.reply_text("⏳ Processing...")
     merged=f"{original}\n\nCORRECTION: {correction}"
-    action=ai_parse(merged, projs, subs)
+    sender=owner_name(update.effective_user.id)
+    action=ai_parse(merged, projs, subs, sender_name=sender, owners=list(OWNERS.values()))
     act=action.get("action","unknown")
 
     if act not in CONFIRM_ACTIONS:
@@ -382,6 +413,28 @@ async def do_summary(update, ctx):
     except: await update.message.reply_text("❌ Error.", reply_markup=OWNER_KB)
     return OWNER_MENU_ST
 
+async def do_tomorrow(update, ctx):
+    """Кто где завтра: all Pending reminders dated tomorrow, across all owners."""
+    try:
+        ss=get_ss()
+        tomorrow=(datetime.now()+timedelta(days=1)).strftime("%Y-%m-%d")
+        rems=[r for r in pending_reminders(ss) if r["date"]==tomorrow]
+        if not rems:
+            await update.message.reply_text("📅 На завтра напоминаний нет.", reply_markup=OWNER_KB)
+            return OWNER_MENU_ST
+        rems.sort(key=lambda r: r["time"] or "99:99")
+        t=f"📅 Завтра ({tomorrow}):\n\n"
+        for r in rems:
+            who=", ".join(r["assigned_to"]) or "—"
+            time_part=f"{r['time']} — " if r["time"] else ""
+            proj_part=f" [{r['customer']}]" if r["customer"] else ""
+            t+=f"• {time_part}{who}: {r['description']}{proj_part}\n"
+        await update.message.reply_text(t, reply_markup=OWNER_KB)
+    except Exception as e:
+        log.error(f"do_tomorrow: {e}")
+        await update.message.reply_text("❌ Error.", reply_markup=OWNER_KB)
+    return OWNER_MENU_ST
+
 async def deploy_sheet_cmd(update, ctx):
     uid=update.effective_user.id
     if not is_owner(uid): return
@@ -392,13 +445,3 @@ async def deploy_sheet_cmd(update, ctx):
     except Exception as e:
         log.error(f"deploy_sheet: {e}")
         await update.message.reply_text(f"❌ Error: {e}", reply_markup=OWNER_KB)
-
-async def do_archive(update, ctx):
-    try:
-        arch=[p for p in all_projects(get_ss().worksheet("Projects")) if p["status"]=="Completed"]
-    except: arch=[]
-    if not arch: await update.message.reply_text("📁 Empty.", reply_markup=OWNER_KB)
-    else:
-        t="📁 *Archive:*\n"+"\n".join(f"• {p['id']} — {p['po']}" for p in arch)
-        await update.message.reply_text(t, parse_mode="Markdown", reply_markup=OWNER_KB)
-    return OWNER_MENU_ST
