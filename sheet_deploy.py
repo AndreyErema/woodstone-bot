@@ -26,11 +26,25 @@ def _default_period():
     start = end - timedelta(days=30)
     return start.strftime("%m/%d/%Y"), end.strftime("%m/%d/%Y")
 
+def _parse_date_loose(s):
+    for fmt in ("%m/%d/%Y", "%Y-%m-%d", "%d.%m.%Y", "%m/%d/%y"):
+        try: return datetime.strptime((s or "").strip(), fmt)
+        except Exception: continue
+    return None
+
 def _existing_period(sh):
+    """Only trust A2/B2 as a previously-set period if this sheet was already
+    in our layout (A1 marker) AND both cells actually parse as dates —
+    otherwise a sheet left over from an older layout (or a fresh one) would
+    have its leftover data cells misread as period dates."""
     vals = sh.get_all_values()
+    if not vals or not vals[0] or (vals[0][0] if vals[0] else "") != "Выбрать период":
+        return "", ""
     a2 = vals[1][0] if len(vals) > 1 and len(vals[1]) > 0 else ""
     b2 = vals[1][1] if len(vals) > 1 and len(vals[1]) > 1 else ""
-    return a2, b2
+    if _parse_date_loose(a2) and _parse_date_loose(b2):
+        return a2, b2
+    return "", ""
 
 TIMESHEET_HEADER_FORMULA = '''=TRANSPOSE(SORT(UNIQUE(FILTER(Shifts!B2:B,(Shifts!A2:A>=TEXT($A$2,"yyyy-mm-dd"))*(Shifts!A2:A<=TEXT($B$2,"yyyy-mm-dd")),Shifts!B2:B<>""))))'''
 TIMESHEET_DATES_FORMULA = '''=SEQUENCE($B$2-$A$2+1,1,$A$2,1)'''
