@@ -12,7 +12,7 @@ def claude(prompt, image_b64=None, max_tokens=300):
     if image_b64:
         content.append({"type":"image","source":{"type":"base64","media_type":"image/jpeg","data":image_b64}})
     content.append({"type":"text","text":prompt})
-    body=json.dumps({"model":"claude-sonnet-4-20250514","max_tokens":max_tokens,
+    body=json.dumps({"model":"claude-sonnet-5","max_tokens":max_tokens,
         "messages":[{"role":"user","content":content}]})
     req=urllib.request.Request("https://api.anthropic.com/v1/messages",data=body.encode(),
         headers={"Content-Type":"application/json","x-api-key":ANTHROPIC_API_KEY,"anthropic-version":"2023-06-01"})
