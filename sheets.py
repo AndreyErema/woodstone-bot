@@ -1,0 +1,263 @@
+"""
+Google Sheets client, schema init, and data access helpers.
+"""
+
+from datetime import datetime, timedelta
+import gspread
+from google.oauth2.service_account import Credentials
+
+from config import SPREADSHEET_ID, GOOGLE_CREDS_FILE, is_owner, owner_name, log
+
+import os, json
+
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets","https://www.googleapis.com/auth/drive"]
+
+def get_creds():
+    cj = os.environ.get("GOOGLE_CREDS_JSON","")
+    if cj: return Credentials.from_service_account_info(json.loads(cj), scopes=SCOPES)
+    return Credentials.from_service_account_file(GOOGLE_CREDS_FILE, scopes=SCOPES)
+
+def get_ss():
+    return gspread.authorize(get_creds()).open_by_key(SPREADSHEET_ID)
+
+def gs(ss, title, headers):
+    try: return ss.worksheet(title)
+    except gspread.exceptions.WorksheetNotFound:
+        sh = ss.add_worksheet(title=title, rows=1000, cols=len(headers))
+        sh.append_row(headers, value_input_option="USER_ENTERED"); return sh
+
+def init(ss):
+    gs(ss,"Projects",["Project ID","PO","Customer","Address","Description","Price","Status","Incom","Expenses","balance","Date","Posted by"])
+    gs(ss,"Payments",["Project ID","PO","Amount","Data","Posted by","Check"])
+    gs(ss,"Expenses",["Project ID","PO","Category","Amount","Description","Data","Posted by"])
+    gs(ss,"Shifts",["Data","sub","ID","Project ID","Start","Finish","hours","PO"])
+    gs(ss,"Payroll",["ID","Sub","Amount","Data","Posted by"])
+    gs(ss,"Subs",["Telegram ID","name","Date added","status","Posted by","Rate"])
+    gs(ss,"Journal",["Project ID","PO","Description","Data","Posted by"])
+    gs(ss,"Customers",["Customer ID","Name","Address","phone","email","projects (PO)","Communication","Description","Data","Posted by"])
+    gs(ss,"Summary",["Metric","Value","Note"])
+
+# ============================================================
+# HELPERS
+# ============================================================
+def sub_info(ss, uid):
+    try:
+        for i,r in enumerate(ss.worksheet("Subs").get_all_values()[1:], 2):
+            if str(r[0]).strip()==str(uid): return {"name":r[1],"status":r[3],"row":i,"rate":float(r[5]) if len(r)>5 and r[5] else 0}
+    except: pass
+    return None
+
+def user_name(update):
+    uid=update.effective_user.id
+    if is_owner(uid): return owner_name(uid)
+    try:
+        i=sub_info(get_ss(),uid)
+        if i: return i["name"]
+    except: pass
+    return update.effective_user.first_name or "?"
+
+def next_pid(ps):
+    recs=ps.get_all_values()
+    if len(recs)<=1: return "0001"
+    mx=max((int(r[0]) for r in recs[1:] if r[0].isdigit()),default=0)
+    return str(mx+1).zfill(4)
+
+def next_cid(cs):
+    recs=cs.get_all_values()
+    if len(recs)<=1: return "C001"
+    mx=max((int(r[0].replace("C","")) for r in recs[1:] if r[0].startswith("C") and r[0][1:].isdigit()),default=0)
+    return f"C{mx+1:03d}"
+
+def active_projects(ps):
+    recs=ps.get_all_values()
+    if len(recs)<=1: return []
+    return [{"id":r[0],"po":r[1],"addr":r[3],"status":r[6] if len(r)>6 else "New"} for r in recs[1:] if (r[6] if len(r)>6 else "New")!="Completed"]
+
+def all_projects(ps):
+    recs=ps.get_all_values()
+    if len(recs)<=1: return []
+    return [{"id":r[0],"po":r[1],"customer":r[2] if len(r)>2 else "","addr":r[3] if len(r)>3 else "","desc":r[4] if len(r)>4 else "","price":r[5] if len(r)>5 else "","status":r[6] if len(r)>6 else "New"} for r in recs[1:]]
+
+def find_proj_row(ps,pid):
+    for i,r in enumerate(ps.get_all_values()):
+        if str(r[0])==str(pid): return i+1
+    return -1
+
+def proj_addr(ps,pid):
+    for r in ps.get_all_values()[1:]:
+        if str(r[0])==str(pid): return r[3] if len(r)>3 else ""
+    return ""
+
+def proj_po(ps,pid):
+    for r in ps.get_all_values()[1:]:
+        if str(r[0])==str(pid): return r[1] if len(r)>1 else ""
+    return ""
+
+def update_totals(ss,pid):
+    ps=ss.worksheet("Projects");pays=ss.worksheet("Payments");exps=ss.worksheet("Expenses")
+    tp=sum(float(r[2]) for r in pays.get_all_values()[1:] if str(r[0])==str(pid) and r[2])
+    te=sum(float(r[3]) for r in exps.get_all_values()[1:] if str(r[0])==str(pid) and r[3])
+    rn=find_proj_row(ps,pid)
+    if rn>0: ps.update(f"H{rn}",[[tp]]);ps.update(f"I{rn}",[[te]]);ps.update(f"J{rn}",[[tp-te]])
+
+def approved_subs(ss):
+    try:
+        recs=ss.worksheet("Subs").get_all_values()
+        return [{"name":r[1],"rate":float(r[5]) if len(r)>5 and r[5] else 0} for r in recs[1:] if len(r)>3 and r[3]=="Approved"]
+    except: return []
+
+def active_shift(ss,uid):
+    try:
+        for i,r in enumerate(ss.worksheet("Shifts").get_all_values()[1:],2):
+            if str(r[2]).strip()==str(uid) and r[4] and (len(r)<6 or not r[5]):
+                return {"row":i,"pid":r[3],"po":r[7] if len(r)>7 else "","start":r[4]}
+    except: pass
+    return None
+
+# ============================================================
+# SUMMARY
+# ============================================================
+def build_summary(ss):
+    now=datetime.now()
+    # Find Monday of current week
+    mon=now-timedelta(days=now.weekday())
+    fri=mon+timedelta(days=4)
+    mon_s=mon.strftime("%Y-%m-%d"); fri_s=fri.strftime("%Y-%m-%d")
+
+    ps=ss.worksheet("Projects").get_all_values()
+    tp=tr=te=0;ac=cc=0
+    for r in ps[1:]:
+        try:
+            p=float(r[5]) if r[5] else 0;rc=float(r[7]) if len(r)>7 and r[7] else 0
+            ex=float(r[8]) if len(r)>8 and r[8] else 0;st=r[6] if len(r)>6 else ""
+            tp+=p;tr+=rc;te+=ex
+            if st=="Completed":cc+=1
+            else:ac+=1
+        except:pass
+    wpay=wexp=wzp=0;ebc={};zbs={};tzp=0
+    for r in ss.worksheet("Payments").get_all_values()[1:]:
+        try:
+            ds=r[3][:10]
+            if mon_s<=ds<=fri_s: wpay+=float(r[2])
+        except:pass
+    for r in ss.worksheet("Expenses").get_all_values()[1:]:
+        try:
+            cat=r[2];amt=float(r[3]);ds=r[5][:10]
+            ebc[cat]=ebc.get(cat,0)+amt
+            if mon_s<=ds<=fri_s: wexp+=amt
+        except:pass
+    for r in ss.worksheet("Payroll").get_all_values()[1:]:
+        try:
+            s=r[1];a=float(r[2]);ds=r[3][:10]
+            tzp+=a;zbs[s]=zbs.get(s,0)+a
+            if mon_s<=ds<=fri_s: wzp+=a
+        except:pass
+    bal=tr-te-tzp;co=tp-tr
+    t=f"📊 *WEEKLY SUMMARY*\n📅 {mon.strftime('%m/%d')} — {fri.strftime('%m/%d/%Y')} (Mon-Fri)\n\n"
+    t+=f"*This week:*\n💰 Received: ${wpay:,.2f}\n💸 Expenses: ${wexp:,.2f}\n👷 Payroll: ${wzp:,.2f}\n"
+    t+=f"\n*Total:*\n🏗 Active: {ac}\n💵 Total value: ${tp:,.2f}\n✅ Received: ${tr:,.2f}\n"
+    t+=f"💸 Expenses: ${te:,.2f}\n👷 Payroll: ${tzp:,.2f}\n📈 Owed by clients: ${co:,.2f}\n💰 Balance: ${bal:,.2f}\n"
+    if ebc:
+        t+="\n*By category:*\n"
+        for c,a in sorted(ebc.items()): t+=f"  • {c}: ${a:,.2f}\n"
+    if zbs:
+        t+="\n*Payroll by sub:*\n"
+        for s,a in sorted(zbs.items()): t+=f"  • {s}: ${a:,.2f}\n"
+    return t
+
+def update_summary_sheet(ss):
+    try:
+        now=datetime.now()
+        ps_d=ss.worksheet("Projects").get_all_values()
+        pay_d=ss.worksheet("Payments").get_all_values()
+        exp_d=ss.worksheet("Expenses").get_all_values()
+        zp_d=ss.worksheet("Payroll").get_all_values()
+        tp=tr=te=0;ac=cc=0
+        for r in ps_d[1:]:
+            try:
+                p=float(r[5]) if r[5] else 0;rc=float(r[7]) if len(r)>7 and r[7] else 0
+                ex=float(r[8]) if len(r)>8 and r[8] else 0;st=r[6] if len(r)>6 else ""
+                tp+=p;tr+=rc;te+=ex
+                if st=="Completed":cc+=1
+                else:ac+=1
+            except:pass
+        ebc={};zbs={};tzp=0
+        for r in exp_d[1:]:
+            try:ebc[r[2]]=ebc.get(r[2],0)+float(r[3])
+            except:pass
+        for r in zp_d[1:]:
+            try:tzp+=float(r[2]);zbs[r[1]]=zbs.get(r[1],0)+float(r[2])
+            except:pass
+        bal=tr-te-tzp;co=tp-tr
+        # Weekly columns
+        all_dates=[]
+        for r in pay_d[1:]:
+            try:all_dates.append(r[3][:10])
+            except:pass
+        for r in exp_d[1:]:
+            try:all_dates.append(r[5][:10])
+            except:pass
+        for r in zp_d[1:]:
+            try:all_dates.append(r[3][:10])
+            except:pass
+        if not all_dates:all_dates=[now.strftime("%Y-%m-%d")]
+        try:min_dt=datetime.strptime(min(all_dates),"%Y-%m-%d")
+        except:min_dt=now
+        def wk_start(dt):return dt-timedelta(days=dt.weekday())
+        weeks=[];w=wk_start(now)
+        while w>=wk_start(min_dt):weeks.append((w,w+timedelta(days=4)));w-=timedelta(days=7) # Mon-Fri
+        def inw(ds,s,e):
+            try:return s.strftime("%Y-%m-%d")<=ds[:10]<=e.strftime("%Y-%m-%d")
+            except:return False
+        cats=sorted(ebc.keys());subs_n=sorted(zbs.keys())
+        wdata=[]
+        for s,e in weeks:
+            wp=we=wz=0;wec={};wzs={}
+            for r in pay_d[1:]:
+                try:
+                    if inw(r[3],s,e):wp+=float(r[2])
+                except:pass
+            for r in exp_d[1:]:
+                try:
+                    if inw(r[5],s,e):a=float(r[3]);c=r[2];we+=a;wec[c]=wec.get(c,0)+a
+                except:pass
+            for r in zp_d[1:]:
+                try:
+                    if inw(r[3],s,e):a=float(r[2]);sn=r[1];wz+=a;wzs[sn]=wzs.get(sn,0)+a
+                except:pass
+            wdata.append({"l":f"{s.strftime('%m/%d')}-{e.strftime('%m/%d')}","p":wp,"e":we,"z":wz,"ec":wec,"zs":wzs})
+        labels=["SUMMARY","","--- TOTALS ---","Active","Completed","Total value","Received (all)","Expenses (all)","Payroll (all)","Owed by clients","BALANCE","","--- WEEKLY (Mon-Fri) ---","Received","Expenses","Payroll","","Expenses by category:"]
+        for c in cats:labels.append(f"  {c}")
+        labels+=["","Payroll by sub:"]
+        for s in subs_n:labels.append(f"  {s}")
+        nc=2+len(weeks);mx=[]
+        for lb in labels:
+            row=[lb]
+            v=""
+            if lb=="SUMMARY":v=f"Updated: {now.strftime('%Y-%m-%d %H:%M')}"
+            elif lb=="Active":v=ac
+            elif lb=="Completed":v=cc
+            elif lb=="Total value":v=tp
+            elif lb=="Received (all)":v=tr
+            elif lb=="Expenses (all)":v=te
+            elif lb=="Payroll (all)":v=tzp
+            elif lb=="Owed by clients":v=co
+            elif lb=="BALANCE":v=bal
+            elif lb=="--- WEEKLY (Mon-Fri) ---":v="Current"
+            elif lb.startswith("  ") and lb.strip() in ebc:v=ebc[lb.strip()]
+            elif lb.startswith("  ") and lb.strip() in zbs:v=zbs[lb.strip()]
+            row.append(v if v!="" else "")
+            for wd in wdata:
+                if lb=="--- WEEKLY (Mon-Fri) ---":row.append(wd["l"])
+                elif lb=="Received":row.append(wd["p"] if wd["p"] else "")
+                elif lb=="Expenses":row.append(wd["e"] if wd["e"] else "")
+                elif lb=="Payroll":row.append(wd["z"] if wd["z"] else "")
+                elif lb.startswith("  ") and lb.strip() in ebc:row.append(wd["ec"].get(lb.strip(),""))
+                elif lb.startswith("  ") and lb.strip() in zbs:row.append(wd["zs"].get(lb.strip(),""))
+                else:row.append("")
+            mx.append(row)
+        try:sh=ss.worksheet("Summary");sh.clear()
+        except:sh=ss.add_worksheet(title="Summary",rows=50,cols=nc)
+        if sh.col_count<nc:sh.resize(cols=nc)
+        sh.update("A1",mx,value_input_option="USER_ENTERED")
+    except Exception as e:log.error(f"Summary: {e}")
