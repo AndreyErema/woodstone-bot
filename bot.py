@@ -30,14 +30,14 @@ SPREADSHEET_ID = os.environ.get("SPREADSHEET_ID", "YOUR_SPREADSHEET_ID_HERE")
 GOOGLE_CREDS_FILE = os.environ.get("GOOGLE_CREDS_FILE", "credentials.json")
 RECEIPTS_CHANNEL_ID = int(os.environ.get("RECEIPTS_CHANNEL_ID", "-1003389113880"))
 
-# Владельцы (ID: Имя)
-OWNERS = {
-     76341596: "Jeremy",
-    139580832: "Serge",
-    1173624685: "Kastet",
-}
-
-
+# Владельцы — из переменной окружения OWNERS_JSON
+# Формат: {"76341596": "Jeremy", "139580832": "Serge", "1173624685": "Kastet"}
+_owners_raw = os.environ.get("OWNERS_JSON", '{"76341596": "Jeremy"}')
+try:
+    OWNERS = {int(k): v for k, v in json.loads(_owners_raw).items()}
+except:
+    OWNERS = {76341596: "Jeremy"}
+    logger.error("Ошибка парсинга OWNERS_JSON, используется значение по умолчанию")
 
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -48,6 +48,7 @@ logger = logging.getLogger(__name__)
 (
     MAIN_MENU,
     NEW_PROJECT_ADDRESS, NEW_PROJECT_DESCRIPTION, NEW_PROJECT_PRICE,
+    QUICK_PROJECT_TEXT, QUICK_PROJECT_CONFIRM,
     PAY_SELECT_PROJECT, PAY_METHOD, PAY_AMOUNT, PAY_PHOTO, PAY_CONFIRM,
     EXP_SELECT_PROJECT, EXP_CATEGORY, EXP_METHOD, EXP_AMOUNT, EXP_PHOTO, EXP_CONFIRM, EXP_DESCRIPTION,
     STATUS_DESC_SELECT_PROJECT, STATUS_DESC_TEXT,
@@ -57,7 +58,7 @@ logger = logging.getLogger(__name__)
     SUB_MENU, SUB_SHIFT_START_SELECT, SUB_SHIFT_END_CONFIRM,
     SUB_REGISTER_NAME,
     OWNER_SHIFT_START_SELECT,
-) = range(29)
+) = range(31)
 
 # ============================================================
 # GOOGLE SHEETS
@@ -211,6 +212,40 @@ async def send_photo_to_channel(context, fid, caption):
     except Exception as e: logger.error(f"Channel error: {e}")
     return ""
 
+def parse_project_text(text):
+    """Отправить текст Claude для парсинга адреса, описания, цены."""
+    try:
+        ak = os.environ.get("ANTHROPIC_API_KEY","")
+        if not ak: return None
+        body = json.dumps({"model":"claude-sonnet-4-20250514","max_tokens":200,
+            "messages":[{"role":"user","content":
+                f"Parse this construction project description into JSON. Extract address, description of work, and price.\n"
+                f"Return ONLY valid JSON, no markdown, no explanation.\n"
+                f"Format: {{\"address\": \"...\", \"description\": \"...\", \"price\": number}}\n"
+                f"If price not found, use 0.\n\n"
+                f"Text: {text}"
+            }]})
+        req = urllib.request.Request("https://api.anthropic.com/v1/messages",data=body.encode("utf-8"),
+            headers={"Content-Type":"application/json","x-api-key":ak,"anthropic-version":"2023-06-01"})
+        with urllib.request.urlopen(req,timeout=30) as resp:
+            res = json.loads(resp.read().decode("utf-8"))
+        ans = "".join(b.get("text","") for b in res.get("content",[]) if b.get("type")=="text")
+        logger.info(f"Parse project: {ans}")
+        return json.loads(ans.strip())
+    except Exception as e:
+        logger.error(f"Parse error: {e}"); return None
+
+def find_projects_by_text(ps, query):
+    """Найти проекты по тексту (адрес, номер дома, улица)."""
+    query = query.lower().strip()
+    all_p = get_active_projects(ps)
+    # Точное совпадение по ID
+    exact = [p for p in all_p if p["id"] == query or p["id"] == query.zfill(4)]
+    if exact: return exact
+    # Поиск по адресу
+    matches = [p for p in all_p if query in p["address"].lower()]
+    return matches
+
 # ============================================================
 # СВОДКА
 # ============================================================
@@ -359,8 +394,8 @@ def update_summary_sheet(ss):
 
 OWNER_MENU = ReplyKeyboardMarkup([
     ["📋 Новый проект", "💰 Задаток/Приход"],
-    ["💸 Записать расход", "📝 Добавить описание"],
-    ["🔄 Изменить статус", "📊 Статус проекта"],
+    ["💸 Записать расход", "📝 Описание"],
+    ["🔄 Статус", "📊 Инфо проекта"],
     ["📈 Сводка", "💵 Оплата сабу"],
     ["🟢 Начать смену", "🔴 Закончить смену"],
     ["📁 Архив"],
@@ -495,17 +530,22 @@ async def owner_menu(update, context):
         return MAIN_MENU
     t = update.message.text
     if t == "📋 Новый проект":
-        await update.message.reply_text("📋 Адрес проекта:", reply_markup=ReplyKeyboardRemove())
-        return NEW_PROJECT_ADDRESS
+        await update.message.reply_text(
+            "📋 Опиши проект одним сообщением:\n\n"
+            "Пример: 123 Main St Kingsport, deck and siding, 15000\n\n"
+            "Или введи просто адрес — описание и цену добавишь потом.",
+            reply_markup=ReplyKeyboardRemove())
+        return QUICK_PROJECT_TEXT
     elif t == "💰 Задаток/Приход":
+        await update.message.reply_text("💰 Введи адрес/номер проекта или выбери:", reply_markup=ReplyKeyboardRemove())
         return await show_projects(update, context, PAY_SELECT_PROJECT)
     elif t == "💸 Записать расход":
         return await show_projects(update, context, EXP_SELECT_PROJECT)
-    elif t == "📝 Добавить описание":
+    elif t == "📝 Описание":
         return await show_projects(update, context, STATUS_DESC_SELECT_PROJECT)
-    elif t == "🔄 Изменить статус":
+    elif t == "🔄 Статус":
         return await show_projects(update, context, CHANGE_STATUS_SELECT)
-    elif t == "📊 Статус проекта":
+    elif t == "📊 Инфо проекта":
         return await show_projects(update, context, VIEW_STATUS_SELECT, True)
     elif t == "💵 Оплата сабу":
         return await show_subs(update, context)
@@ -746,27 +786,93 @@ async def cancel_cb(update, context):
     await q.message.reply_text("Меню:", reply_markup=mk); return MAIN_MENU if is_owner(uid) else SUB_MENU
 
 # ============================================================
-# НОВЫЙ ПРОЕКТ
+# НОВЫЙ ПРОЕКТ (быстрый — одним сообщением)
 # ============================================================
 
-async def np_address(update, context):
-    context.user_data["np_addr"] = update.message.text
-    await update.message.reply_text("📝 Описание:"); return NEW_PROJECT_DESCRIPTION
+async def quick_project_text(update, context):
+    """Получить текст проекта, отправить Claude для парсинга."""
+    text = update.message.text.strip()
 
-async def np_desc(update, context):
-    context.user_data["np_desc"] = update.message.text
-    await update.message.reply_text("💵 Цена:"); return NEW_PROJECT_PRICE
+    # Попробовать распарсить через Claude
+    parsed = parse_project_text(text)
 
-async def np_price(update, context):
-    try: price = float(update.message.text.replace(",","").replace("$",""))
-    except: await update.message.reply_text("❌ Число!"); return NEW_PROJECT_PRICE
-    user = get_owner_name(update.effective_user.id); now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    if parsed and parsed.get("address"):
+        context.user_data["qp_addr"] = parsed.get("address", "")
+        context.user_data["qp_desc"] = parsed.get("description", "")
+        context.user_data["qp_price"] = parsed.get("price", 0)
+
+        price_str = f"${parsed['price']:,.2f}" if parsed.get("price") else "не указана"
+        btns = [
+            [InlineKeyboardButton("✅ Верно", callback_data="qp_yes")],
+            [InlineKeyboardButton("✏️ Изменить цену", callback_data="qp_price")],
+            [InlineKeyboardButton("❌ Отмена", callback_data="cancel")],
+        ]
+        await update.message.reply_text(
+            f"📋 Проект:\n\n"
+            f"📍 Адрес: {parsed.get('address','')}\n"
+            f"📝 Описание: {parsed.get('description','') or '—'}\n"
+            f"💵 Цена: {price_str}\n\n"
+            f"Верно?",
+            reply_markup=InlineKeyboardMarkup(btns))
+        return QUICK_PROJECT_CONFIRM
+    else:
+        # Не удалось распарсить — используем как адрес
+        context.user_data["qp_addr"] = text
+        context.user_data["qp_desc"] = ""
+        context.user_data["qp_price"] = 0
+        btns = [
+            [InlineKeyboardButton("✅ Создать без цены", callback_data="qp_yes")],
+            [InlineKeyboardButton("✏️ Добавить цену", callback_data="qp_price")],
+            [InlineKeyboardButton("❌ Отмена", callback_data="cancel")],
+        ]
+        await update.message.reply_text(
+            f"📋 Проект:\n\n📍 Адрес: {text}\n📝 Описание: —\n💵 Цена: не указана\n\nВерно?",
+            reply_markup=InlineKeyboardMarkup(btns))
+        return QUICK_PROJECT_CONFIRM
+
+async def quick_project_confirm(update, context):
+    q = update.callback_query; await q.answer()
+    if q.data == "cancel": return await cancel_cb(update, context)
+    if q.data == "qp_price":
+        await q.edit_message_text("💵 Введи цену:")
+        return QUICK_PROJECT_CONFIRM
+    if q.data == "qp_yes":
+        return await _create_project(q, context)
+
+async def quick_project_price_text(update, context):
+    """Ручной ввод цены после парсинга."""
+    try:
+        price = float(update.message.text.replace(",","").replace("$",""))
+        context.user_data["qp_price"] = price
+    except:
+        await update.message.reply_text("❌ Число! Например: 15000")
+        return QUICK_PROJECT_CONFIRM
+    return await _create_project_msg(update, context)
+
+async def _create_project(q, context):
+    user = get_owner_name(q.from_user.id); now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    addr = context.user_data.get("qp_addr",""); desc = context.user_data.get("qp_desc","")
+    price = context.user_data.get("qp_price", 0)
     try:
         ss = get_spreadsheet(); ps = init_sheets(ss); pid = get_next_project_id(ps)
-        ps.append_row([pid, context.user_data["np_addr"], context.user_data["np_desc"], price, "Новый", 0, 0, 0, now, user], value_input_option="USER_ENTERED")
-        await update.message.reply_text(f"✅ {pid}\n📍 {context.user_data['np_addr']}\n💵 ${price:,.2f}\n👤 {user}", reply_markup=OWNER_MENU)
+        ps.append_row([pid, addr, desc, price, "Новый", 0, 0, 0, now, user], value_input_option="USER_ENTERED")
+        await q.edit_message_text(f"✅ Проект создан!\n\n🆔 {pid}\n📍 {addr}\n📝 {desc or '—'}\n💵 ${price:,.2f}\n👤 {user}")
+    except Exception as e:
+        logger.error(f"Error: {e}"); await q.edit_message_text("❌ Ошибка.")
+    for k in ["qp_addr","qp_desc","qp_price"]: context.user_data.pop(k,None)
+    await q.message.reply_text("Меню:", reply_markup=OWNER_MENU); return MAIN_MENU
+
+async def _create_project_msg(update, context):
+    user = get_owner_name(update.effective_user.id); now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    addr = context.user_data.get("qp_addr",""); desc = context.user_data.get("qp_desc","")
+    price = context.user_data.get("qp_price", 0)
+    try:
+        ss = get_spreadsheet(); ps = init_sheets(ss); pid = get_next_project_id(ps)
+        ps.append_row([pid, addr, desc, price, "Новый", 0, 0, 0, now, user], value_input_option="USER_ENTERED")
+        await update.message.reply_text(f"✅ Проект создан!\n\n🆔 {pid}\n📍 {addr}\n📝 {desc or '—'}\n💵 ${price:,.2f}\n👤 {user}", reply_markup=OWNER_MENU)
     except Exception as e:
         logger.error(f"Error: {e}"); await update.message.reply_text("❌ Ошибка.", reply_markup=OWNER_MENU)
+    for k in ["qp_addr","qp_desc","qp_price"]: context.user_data.pop(k,None)
     return MAIN_MENU
 
 # ============================================================
@@ -1086,9 +1192,8 @@ def main():
             SUB_MENU: [MessageHandler(filters.TEXT & ~filters.COMMAND, sub_menu_handler)],
             SUB_REGISTER_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, sub_register_name)],
             SUB_SHIFT_START_SELECT: [CallbackQueryHandler(sub_shift_start, pattern="^sshift_"), CallbackQueryHandler(cancel_cb, pattern="^scancel$")],
-            NEW_PROJECT_ADDRESS: [MessageHandler(filters.TEXT & ~filters.COMMAND, np_address)],
-            NEW_PROJECT_DESCRIPTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, np_desc)],
-            NEW_PROJECT_PRICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, np_price)],
+            QUICK_PROJECT_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, quick_project_text)],
+            QUICK_PROJECT_CONFIRM: [CallbackQueryHandler(quick_project_confirm, pattern="^qp_"), CallbackQueryHandler(cancel_cb, pattern="^cancel$"), MessageHandler(filters.TEXT & ~filters.COMMAND, quick_project_price_text)],
             PAY_SELECT_PROJECT: [CallbackQueryHandler(pay_select, pattern="^proj_"), CallbackQueryHandler(cancel_cb, pattern="^cancel$")],
             PAY_METHOD: [CallbackQueryHandler(pay_method, pattern="^pay_"), CallbackQueryHandler(cancel_cb, pattern="^cancel$")],
             PAY_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, pay_amount)],
