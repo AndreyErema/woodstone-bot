@@ -16,10 +16,10 @@ from config import (
     PHOTO_WAIT_RECEIPT, PHOTO_CONFIRM_RECEIPT,
     PHOTO_WAIT_INVOICE, PHOTO_CONFIRM_INVOICE,
     SUB_MENU_ST, SUB_SHIFT_SELECT, SUB_REGISTER_NAME,
-    CONFIRM_ACTION,
+    CONFIRM_ACTION, AI_CONFIRM_ST, AI_EDIT_ST,
 )
 from sheets import get_ss, init
-from handlers_owner import start, cancel_cmd, owner_handler, free_text_handler
+from handlers_owner import start, cancel_cmd, owner_handler, free_text_handler, ai_confirm_cb, ai_edit_text
 from handlers_scan import (
     receipt_proj_select, invoice_proj_select, photo_received,
     scan_confirm, scan_manual_amt,
@@ -48,6 +48,8 @@ def main():
             SUB_SHIFT_SELECT:[CallbackQueryHandler(sub_shift_cb,pattern="^sshift_"),CallbackQueryHandler(sub_shift_cb,pattern="^scancel$")],
             SUB_REGISTER_NAME:[MessageHandler(filters.TEXT & ~filters.COMMAND,sub_register)],
             CONFIRM_ACTION:[CallbackQueryHandler(oshift_cb,pattern="^oshift_"),CallbackQueryHandler(oshift_cb,pattern="^cancel$")],
+            AI_CONFIRM_ST:[CallbackQueryHandler(ai_confirm_cb,pattern="^(aiok|aiedit|aicancel)$")],
+            AI_EDIT_ST:[MessageHandler(filters.TEXT & ~filters.COMMAND,ai_edit_text)],
         },
         fallbacks=[CommandHandler("cancel",cancel_cmd),CommandHandler("start",start)],
     )

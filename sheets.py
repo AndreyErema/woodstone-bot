@@ -4,6 +4,7 @@ Google Sheets client, schema init, and data access helpers.
 
 from datetime import datetime, timedelta
 import gspread
+from gspread.utils import rowcol_to_a1
 from google.oauth2.service_account import Credentials
 
 from config import SPREADSHEET_ID, GOOGLE_CREDS_FILE, is_owner, owner_name, log
@@ -94,11 +95,13 @@ def proj_po(ps,pid):
     return ""
 
 def update_totals(ss,pid):
-    ps=ss.worksheet("Projects");pays=ss.worksheet("Payments");exps=ss.worksheet("Expenses")
-    tp=sum(float(r[2]) for r in pays.get_all_values()[1:] if str(r[0])==str(pid) and r[2])
-    te=sum(float(r[3]) for r in exps.get_all_values()[1:] if str(r[0])==str(pid) and r[3])
+    """Set live Google Sheets formulas for Incom/Expenses/balance (Sheets computes these, not the bot)."""
+    ps=ss.worksheet("Projects")
     rn=find_proj_row(ps,pid)
-    if rn>0: ps.update(f"H{rn}",[[tp]]);ps.update(f"I{rn}",[[te]]);ps.update(f"J{rn}",[[tp-te]])
+    if rn>0:
+        ps.update(f"H{rn}",[[f'=SUMIF(Payments!$A:$A,$A{rn},Payments!$C:$C)']], value_input_option="USER_ENTERED")
+        ps.update(f"I{rn}",[[f'=SUMIF(Expenses!$A:$A,$A{rn},Expenses!$D:$D)']], value_input_option="USER_ENTERED")
+        ps.update(f"J{rn}",[[f'=H{rn}-I{rn}']], value_input_option="USER_ENTERED")
 
 def approved_subs(ss):
     try:
@@ -261,3 +264,59 @@ def update_summary_sheet(ss):
         if sh.col_count<nc:sh.resize(cols=nc)
         sh.update("A1",mx,value_input_option="USER_ENTERED")
     except Exception as e:log.error(f"Summary: {e}")
+
+# ============================================================
+# PIVOT SHEETS (Timesheet, Project Hours) — live SUMIFS formulas,
+# native Sheets filter for period/column filtering.
+# ============================================================
+def _sheets_str(s):
+    return '"' + str(s).replace('"','""') + '"'
+
+def _write_pivot_sheet(ss, title, mx):
+    try:sh=ss.worksheet(title);sh.clear()
+    except:sh=ss.add_worksheet(title=title,rows=len(mx)+10,cols=len(mx[0])+2)
+    if sh.col_count<len(mx[0]):sh.resize(cols=len(mx[0]))
+    if sh.row_count<len(mx):sh.resize(rows=len(mx)+5)
+    sh.update("A1",mx,value_input_option="USER_ENTERED")
+    try:sh.set_basic_filter()
+    except Exception:pass
+
+def update_timesheet_sheet(ss):
+    """Days × subs pivot. Filter arrows on the header let owners filter by date/sub in Sheets directly."""
+    try:
+        rows=ss.worksheet("Shifts").get_all_values()[1:]
+        dates=sorted({r[0] for r in rows if r and r[0]})
+        subs=sorted({r[1] for r in rows if len(r)>1 and r[1]})
+        if not dates or not subs: return
+        headers=["Date"]+subs+["Total"]
+        mx=[headers]
+        for i,d in enumerate(dates,start=2):
+            row=[d]
+            for s in subs:
+                row.append(f'=SUMIFS(Shifts!$G:$G,Shifts!$A:$A,$A{i},Shifts!$B:$B,{_sheets_str(s)})')
+            last_col=rowcol_to_a1(i,len(subs)+1).rstrip("0123456789")
+            row.append(f'=SUM(B{i}:{last_col}{i})')
+            mx.append(row)
+        _write_pivot_sheet(ss,"Timesheet",mx)
+    except Exception as e:log.error(f"Timesheet: {e}")
+
+def update_project_hours_sheet(ss):
+    """Projects × subs pivot. Filter arrows on the header let owners filter by project/sub in Sheets directly."""
+    try:
+        sh_d=ss.worksheet("Shifts").get_all_values()[1:]
+        proj_d=ss.worksheet("Projects").get_all_values()[1:]
+        pid_po={r[0]:(r[1] if len(r)>1 else "") for r in proj_d if r and r[0]}
+        pids=sorted({r[3] for r in sh_d if len(r)>3 and r[3]})
+        subs=sorted({r[1] for r in sh_d if len(r)>1 and r[1]})
+        if not pids or not subs: return
+        headers=["Project"]+subs+["Total"]
+        mx=[headers]
+        for i,pid in enumerate(pids,start=2):
+            row=[f"{pid} — {pid_po.get(pid,'')}"]
+            for s in subs:
+                row.append(f'=SUMIFS(Shifts!$G:$G,Shifts!$D:$D,{_sheets_str(pid)},Shifts!$B:$B,{_sheets_str(s)})')
+            last_col=rowcol_to_a1(i,len(subs)+1).rstrip("0123456789")
+            row.append(f'=SUM(B{i}:{last_col}{i})')
+            mx.append(row)
+        _write_pivot_sheet(ss,"Project Hours",mx)
+    except Exception as e:log.error(f"Project Hours: {e}")

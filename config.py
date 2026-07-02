@@ -32,4 +32,5 @@ def owner_name(uid): return OWNERS.get(uid,"?")
     PHOTO_WAIT_INVOICE, PHOTO_CONFIRM_INVOICE,
     SUB_MENU_ST, SUB_SHIFT_SELECT, SUB_REGISTER_NAME,
     CONFIRM_ACTION,
-) = range(10)
+    AI_CONFIRM_ST, AI_EDIT_ST,
+) = range(12)

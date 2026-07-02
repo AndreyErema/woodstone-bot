@@ -8,7 +8,7 @@ from telegram.ext import ConversationHandler
 
 from config import log, is_owner, OWNERS, SUB_MENU_ST, SUB_SHIFT_SELECT
 from keyboards import SUB_KB
-from sheets import get_ss, sub_info, active_shift, active_projects, proj_po
+from sheets import get_ss, sub_info, active_shift, active_projects, proj_po, update_timesheet_sheet, update_project_hours_sheet
 
 async def sub_register(update, ctx):
     name=update.message.text.strip(); uid=update.effective_user.id; now_s=datetime.now().strftime("%Y-%m-%d %H:%M")
@@ -59,6 +59,7 @@ async def sub_handler(update, ctx):
             sh=ss.worksheet("Shifts"); now=datetime.now(); now_s=now.strftime("%Y-%m-%d %H:%M")
             start=datetime.strptime(a["start"],"%Y-%m-%d %H:%M"); hrs=round((now-start).total_seconds()/3600,2)
             sh.update(f"F{a['row']}",[[now_s]]); sh.update(f"G{a['row']}",[[hrs]])
+            update_timesheet_sheet(ss); update_project_hours_sheet(ss)
             info=sub_info(ss,uid); name=info["name"] if info else "?"
             # Auto payroll
             rate=info["rate"] if info else 0

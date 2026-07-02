@@ -48,6 +48,8 @@ AVAILABLE ACTIONS (return exactly one):
 - {{"action":"show_project","project_id":"N"}}
 - {{"action":"list_projects"}}
 - {{"action":"add_customer","name":"","address":"","phone":"","email":"","communication":"sms/messenger/email"}}
+- {{"action":"update_project","project_id":"N","field":"po|customer|address|description|price","value":"new value"}} (edit one field of an EXISTING project)
+- {{"action":"update_customer","name":"customer name to match","field":"phone|email|communication|address","value":"new value"}} (edit one field of an EXISTING customer)
 - {{"action":"scan_receipt"}} (user wants to scan a store receipt - expense)
 - {{"action":"scan_invoice"}} (user wants to scan a client invoice/check - payment)
 - {{"action":"unknown","reply":"your helpful response"}}
@@ -57,7 +59,9 @@ RULES:
 - Match subs by name (partial ok). "Родя" = "Родя", "Дане" = "Даня".
 - If user mentions receiving money/check/deposit FROM client → payment. If user mentions spending/buying/purchasing → expense.
 - "закрой проект" or "close project" → status Completed.
+- If the user is correcting/renaming a field of a project or customer that already exists (e.g. "PO пусть будет 671", "смени адрес на ...", "поменяй телефон клиента ..."), use update_project or update_customer — do NOT create a new project/customer for this.
 - Currency: always USD.
+- If the message contains a line starting with "CORRECTION:", it is a correction the user is making to the request right above it. Re-parse the whole thing as ONE corrected action (same action type as before unless the correction clearly changes it).
 - If you can't determine the action, return unknown with a helpful reply.
 - Return ONLY valid JSON, no markdown, no explanation.
 

@@ -1,24 +1,36 @@
 """
 Owner menu, free-text AI-driven actions, and entry point (/start, /cancel).
+
+Write actions parsed from free text (create_project, payment, expense, ...)
+are staged and shown to the owner as a preview before anything is written to
+Sheets — see CONFIRM_ACTIONS / describe_action / apply_write_action.
 """
 
 from datetime import datetime
-from telegram import ReplyKeyboardRemove
+from telegram import ReplyKeyboardRemove, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ConversationHandler
 
 from config import (
     log, is_owner, owner_name,
     OWNER_MENU_ST, OWNER_FREE_TEXT, PHOTO_WAIT_RECEIPT, PHOTO_WAIT_INVOICE,
-    SUB_MENU_ST, SUB_REGISTER_NAME,
+    SUB_MENU_ST, SUB_REGISTER_NAME, AI_CONFIRM_ST, AI_EDIT_ST,
 )
 from keyboards import OWNER_KB, SUB_KB
 from sheets import (
     get_ss, sub_info, next_pid, next_cid, active_projects, all_projects,
     find_proj_row, proj_po, update_totals, approved_subs, update_summary_sheet, build_summary,
+    update_timesheet_sheet, update_project_hours_sheet,
 )
 from ai import ai_parse
 from handlers_scan import show_proj_btns
 from handlers_shifts import owner_shift_start, owner_shift_end
+
+# Actions that change data and must be confirmed by the owner before writing.
+CONFIRM_ACTIONS = {
+    "create_project", "payment", "expense", "change_status", "journal",
+    "pay_sub", "set_rate", "record_hours", "add_customer",
+    "update_project", "update_customer",
+}
 
 # ============================================================
 # /START
@@ -44,6 +56,7 @@ async def start(update, ctx):
 async def cancel_cmd(update, ctx):
     uid=update.effective_user.id
     kb=OWNER_KB if is_owner(uid) else SUB_KB
+    ctx.user_data.pop("pending_action",None); ctx.user_data.pop("pending_text",None)
     await update.message.reply_text("❌ Cancelled.", reply_markup=kb)
     return OWNER_MENU_ST if is_owner(uid) else SUB_MENU_ST
 
@@ -78,10 +91,55 @@ async def owner_handler(update, ctx):
 async def free_text_handler(update, ctx):
     return await process_free_text(update, ctx, update.message.text)
 
-async def process_free_text(update, ctx, text):
-    uid=update.effective_user.id; uname=owner_name(uid)
-    now_s=datetime.now().strftime("%Y-%m-%d %H:%M")
+# ============================================================
+# AI PARSE → PREVIEW → CONFIRM → WRITE
+# ============================================================
+def describe_action(ss, action):
+    """Human-readable preview of a parsed write action, shown before it's saved."""
+    act=action.get("action")
+    if act=="create_project":
+        return (f"📋 *Новый проект*\nPO: {action.get('po') or '—'}\n"
+                f"Клиент: {action.get('customer') or '—'}\n"
+                f"Адрес: {action.get('address') or '—'}\n"
+                f"Описание: {action.get('description') or '—'}\n"
+                f"Цена: ${float(action.get('price',0) or 0):,.2f}")
+    if act=="payment":
+        pid=action.get("project_id",""); po=proj_po(ss.worksheet("Projects"),pid)
+        return f"💰 *Платёж*\nПроект: {pid} ({po or '?'})\nСумма: ${float(action.get('amount',0) or 0):,.2f}\nПримечание: {action.get('note') or '—'}"
+    if act=="expense":
+        pid=action.get("project_id",""); po=proj_po(ss.worksheet("Projects"),pid)
+        return f"💸 *Расход*\nПроект: {pid} ({po or '?'})\nКатегория: {action.get('category','Materials')}\nСумма: ${float(action.get('amount',0) or 0):,.2f}\nОписание: {action.get('description') or '—'}"
+    if act=="change_status":
+        pid=action.get("project_id",""); po=proj_po(ss.worksheet("Projects"),pid)
+        return f"🔄 *Смена статуса*\nПроект: {pid} ({po or '?'})\nНовый статус: {action.get('status')}"
+    if act=="journal":
+        pid=action.get("project_id",""); po=proj_po(ss.worksheet("Projects"),pid)
+        return f"📝 *Запись в журнал*\nПроект: {pid} ({po or '?'})\n{action.get('description')}"
+    if act=="pay_sub":
+        return f"💵 *Выплата сабу*\nСаб: {action.get('sub_name')}\nСумма: ${float(action.get('amount',0) or 0):,.2f}"
+    if act=="set_rate":
+        return f"💲 *Ставка*\nСаб: {action.get('sub_name')}\nСтавка: ${float(action.get('rate',0) or 0)}/ч"
+    if act=="record_hours":
+        pid=action.get("project_id","")
+        po=proj_po(ss.worksheet("Projects"),pid) if pid else ""
+        proj_line=f"{pid} ({po})" if pid else "—"
+        return f"⏱ *Часы*\nСаб: {action.get('sub_name')}\nЧасы: {action.get('hours')}\nПроект: {proj_line}\nДата: {action.get('date') or 'сегодня'}"
+    if act=="add_customer":
+        return (f"👤 *Новый клиент*\nИмя: {action.get('name')}\nАдрес: {action.get('address') or '—'}\n"
+                f"Телефон: {action.get('phone') or '—'}\nEmail: {action.get('email') or '—'}\nСвязь: {action.get('communication') or '—'}")
+    if act=="update_project":
+        pid=action.get("project_id",""); po=proj_po(ss.worksheet("Projects"),pid)
+        return f"✏️ *Изменение проекта*\nПроект: {pid} ({po or '?'})\nПоле: {action.get('field')}\nНовое значение: {action.get('value')}"
+    if act=="update_customer":
+        return f"✏️ *Изменение клиента*\nИмя: {action.get('name')}\nПоле: {action.get('field')}\nНовое значение: {action.get('value')}"
+    return "…"
 
+CONFIRM_BTNS = InlineKeyboardMarkup([
+    [InlineKeyboardButton("✅ Подтвердить",callback_data="aiok"), InlineKeyboardButton("✏️ Изменить",callback_data="aiedit")],
+    [InlineKeyboardButton("❌ Отмена",callback_data="aicancel")],
+])
+
+async def process_free_text(update, ctx, text):
     try: ss=get_ss(); projs=all_projects(ss.worksheet("Projects")); subs=approved_subs(ss)
     except Exception as e:
         log.error(f"DB: {e}"); await update.message.reply_text("❌ Database error.", reply_markup=OWNER_KB); return OWNER_MENU_ST
@@ -90,122 +148,203 @@ async def process_free_text(update, ctx, text):
     action=ai_parse(text, projs, subs)
     act=action.get("action","unknown")
 
+    if act in CONFIRM_ACTIONS:
+        ctx.user_data["pending_action"]=action
+        ctx.user_data["pending_text"]=text
+        await update.message.reply_text(f"{describe_action(ss,action)}\n\nВсё верно?", parse_mode="Markdown", reply_markup=CONFIRM_BTNS)
+        return AI_CONFIRM_ST
+
+    return await run_readonly_action(update, ctx, ss, action)
+
+async def run_readonly_action(update, ctx, ss, action):
+    """Actions that don't change data — executed immediately, no confirmation needed."""
+    act=action.get("action")
     try:
-        if act=="create_project":
-            ps=ss.worksheet("Projects"); pid=next_pid(ps)
-            po=action.get("po",""); cust=action.get("customer",""); addr=action.get("address",""); desc=action.get("description",""); price=float(action.get("price",0))
-            if not po and addr: po=addr[:30]
-            ps.append_row([pid,po,cust,addr,desc,price,"New",0,0,0,now_s,uname], value_input_option="USER_ENTERED")
-            # Add customer if provided
-            if cust:
-                try:
-                    cs=ss.worksheet("Customers"); cid=next_cid(cs)
-                    cs.append_row([cid,cust,addr,"","",po,"","",now_s,uname], value_input_option="USER_ENTERED")
-                except:pass
-            await update.message.reply_text(f"✅ Project created!\n🆔 {pid}\n📋 PO: {po}\n👤 Customer: {cust or '—'}\n📍 {addr}\n📝 {desc or '—'}\n💵 ${price:,.2f}", reply_markup=OWNER_KB)
-
-        elif act=="payment":
-            pid=action.get("project_id",""); amt=float(action.get("amount",0)); note=action.get("note","")
-            po=proj_po(ss.worksheet("Projects"),pid)
-            ss.worksheet("Payments").append_row([pid,po,amt,now_s,f"{uname} {note}".strip(),""], value_input_option="USER_ENTERED")
-            update_totals(ss,pid); update_summary_sheet(ss)
-            await update.message.reply_text(f"✅ Payment recorded!\n🆔 {pid} ({po})\n💰 ${amt:,.2f}", reply_markup=OWNER_KB)
-
-        elif act=="expense":
-            pid=action.get("project_id",""); cat=action.get("category","Materials"); amt=float(action.get("amount",0)); desc=action.get("description","")
-            po=proj_po(ss.worksheet("Projects"),pid)
-            ss.worksheet("Expenses").append_row([pid,po,cat,amt,desc,now_s,uname], value_input_option="USER_ENTERED")
-            update_totals(ss,pid); update_summary_sheet(ss)
-            await update.message.reply_text(f"✅ Expense recorded!\n🆔 {pid} ({po})\n📂 {cat}: ${amt:,.2f}\n📝 {desc or '—'}", reply_markup=OWNER_KB)
-
-        elif act=="change_status":
-            pid=action.get("project_id",""); ns=action.get("status","")
-            ps=ss.worksheet("Projects"); rn=find_proj_row(ps,pid)
-            if rn>0:
-                ps.update(f"G{rn}",[[ns]])
-                po=proj_po(ps,pid)
-                ss.worksheet("Journal").append_row([pid,po,f"Status → {ns}",now_s,uname], value_input_option="USER_ENTERED")
-                await update.message.reply_text(f"✅ {pid} ({po}) → {ns}", reply_markup=OWNER_KB)
-            else: await update.message.reply_text("❌ Project not found.", reply_markup=OWNER_KB)
-
-        elif act=="journal":
-            pid=action.get("project_id",""); desc=action.get("description","")
-            po=proj_po(ss.worksheet("Projects"),pid)
-            ss.worksheet("Journal").append_row([pid,po,desc,now_s,uname], value_input_option="USER_ENTERED")
-            await update.message.reply_text(f"✅ Journal entry added!\n🆔 {pid} ({po})\n📝 {desc}", reply_markup=OWNER_KB)
-
-        elif act=="pay_sub":
-            sn=action.get("sub_name",""); amt=float(action.get("amount",0))
-            ss.worksheet("Payroll").append_row(["",sn,amt,now_s,uname], value_input_option="USER_ENTERED")
-            update_summary_sheet(ss)
-            await update.message.reply_text(f"✅ Paid!\n👷 {sn}: ${amt:,.2f}", reply_markup=OWNER_KB)
-
-        elif act=="set_rate":
-            sn=action.get("sub_name",""); rate=float(action.get("rate",0))
-            sh=ss.worksheet("Subs")
-            for i,r in enumerate(sh.get_all_values()[1:],2):
-                if r[1].lower().strip()==sn.lower().strip():
-                    sh.update(f"F{i}",[[rate]])
-                    await update.message.reply_text(f"✅ {sn} rate → ${rate}/hr", reply_markup=OWNER_KB); break
-            else:
-                await update.message.reply_text(f"❌ Sub '{sn}' not found.", reply_markup=OWNER_KB)
-
-        elif act=="record_hours":
-            sn=action.get("sub_name",""); hrs=float(action.get("hours",0)); pid=action.get("project_id","")
-            dt=action.get("date","")
-            if not dt or dt=="today": dt=datetime.now().strftime("%Y-%m-%d")
-            po=proj_po(ss.worksheet("Projects"),pid) if pid else ""
-            # Find sub's telegram ID
-            sub_tid=""
-            for r in ss.worksheet("Subs").get_all_values()[1:]:
-                if r[1].lower().strip()==sn.lower().strip(): sub_tid=r[0]; break
-            ss.worksheet("Shifts").append_row([dt,sn,sub_tid,pid,f"{dt} 09:00",f"{dt} {9+hrs:.0f}:00",hrs,po], value_input_option="USER_ENTERED")
-            # Auto payroll if rate exists
-            rate=0
-            for s in approved_subs(ss):
-                if s["name"].lower().strip()==sn.lower().strip(): rate=s["rate"]; break
-            if rate>0:
-                pay=round(hrs*rate,2)
-                ss.worksheet("Payroll").append_row(["",sn,pay,f"{dt} (manual)",uname], value_input_option="USER_ENTERED")
-                await update.message.reply_text(f"✅ {sn}: {hrs}h on {dt}\n💵 Auto-pay: ${pay:,.2f} ({hrs}h × ${rate}/hr)", reply_markup=OWNER_KB)
-            else:
-                await update.message.reply_text(f"✅ {sn}: {hrs}h on {dt}\n⚠️ No rate set — payroll not calculated.", reply_markup=OWNER_KB)
-            update_summary_sheet(ss)
-
-        elif act=="show_summary":
+        if act=="show_summary":
             return await do_summary(update, ctx)
-
-        elif act=="show_project":
-            pid=action.get("project_id","")
-            return await do_show_project(update, ctx, ss, pid)
-
-        elif act=="list_projects":
+        if act=="show_project":
+            return await do_show_project(update, ctx, ss, action.get("project_id",""))
+        if act=="list_projects":
             projs=active_projects(ss.worksheet("Projects"))
             if not projs: await update.message.reply_text("📭 No active projects.", reply_markup=OWNER_KB)
             else:
                 t="📋 *Active projects:*\n\n"
                 for p in projs: t+=f"• {p['id']} — {p['po']} [{p['status']}]\n"
                 await update.message.reply_text(t, parse_mode="Markdown", reply_markup=OWNER_KB)
-
-        elif act=="add_customer":
-            cs=ss.worksheet("Customers"); cid=next_cid(cs)
-            cs.append_row([cid,action.get("name",""),action.get("address",""),action.get("phone",""),action.get("email",""),"",action.get("communication",""),"",now_s,uname], value_input_option="USER_ENTERED")
-            await update.message.reply_text(f"✅ Customer added: {action.get('name','')}", reply_markup=OWNER_KB)
-
         elif act=="scan_receipt":
             return await show_proj_btns(update, ctx, PHOTO_WAIT_RECEIPT, "🧾 Select project:")
-
         elif act=="scan_invoice":
             return await show_proj_btns(update, ctx, PHOTO_WAIT_INVOICE, "📄 Select project:")
-
         else:
             reply=action.get("reply","I don't understand. Try rephrasing.")
             await update.message.reply_text(reply, reply_markup=OWNER_KB)
-
     except Exception as e:
         log.error(f"Action error: {e}"); await update.message.reply_text(f"❌ Error: {e}", reply_markup=OWNER_KB)
-
     return OWNER_MENU_ST
+
+async def apply_write_action(ss, action, uname, now_s):
+    """Executes a confirmed write action against Sheets. Returns the result message text."""
+    act=action.get("action")
+    try:
+        if act=="create_project":
+            ps=ss.worksheet("Projects"); pid=next_pid(ps)
+            po=action.get("po",""); cust=action.get("customer",""); addr=action.get("address",""); desc=action.get("description",""); price=float(action.get("price",0))
+            if not po and addr: po=addr[:30]
+            ps.append_row([pid,po,cust,addr,desc,price,"New",0,0,0,now_s,uname], value_input_option="USER_ENTERED")
+            update_totals(ss,pid)
+            if cust:
+                try:
+                    cs=ss.worksheet("Customers"); cid=next_cid(cs)
+                    cs.append_row([cid,cust,addr,"","",po,"","",now_s,uname], value_input_option="USER_ENTERED")
+                except:pass
+            return f"✅ Project created!\n🆔 {pid}\n📋 PO: {po}\n👤 Customer: {cust or '—'}\n📍 {addr}\n📝 {desc or '—'}\n💵 ${price:,.2f}"
+
+        if act=="payment":
+            pid=action.get("project_id",""); amt=float(action.get("amount",0)); note=action.get("note","")
+            po=proj_po(ss.worksheet("Projects"),pid)
+            ss.worksheet("Payments").append_row([pid,po,amt,now_s,f"{uname} {note}".strip(),""], value_input_option="USER_ENTERED")
+            update_totals(ss,pid); update_summary_sheet(ss)
+            return f"✅ Payment recorded!\n🆔 {pid} ({po})\n💰 ${amt:,.2f}"
+
+        if act=="expense":
+            pid=action.get("project_id",""); cat=action.get("category","Materials"); amt=float(action.get("amount",0)); desc=action.get("description","")
+            po=proj_po(ss.worksheet("Projects"),pid)
+            ss.worksheet("Expenses").append_row([pid,po,cat,amt,desc,now_s,uname], value_input_option="USER_ENTERED")
+            update_totals(ss,pid); update_summary_sheet(ss)
+            return f"✅ Expense recorded!\n🆔 {pid} ({po})\n📂 {cat}: ${amt:,.2f}\n📝 {desc or '—'}"
+
+        if act=="change_status":
+            pid=action.get("project_id",""); ns=action.get("status","")
+            ps=ss.worksheet("Projects"); rn=find_proj_row(ps,pid)
+            if rn<1: return "❌ Project not found."
+            ps.update(f"G{rn}",[[ns]])
+            po=proj_po(ps,pid)
+            ss.worksheet("Journal").append_row([pid,po,f"Status → {ns}",now_s,uname], value_input_option="USER_ENTERED")
+            return f"✅ {pid} ({po}) → {ns}"
+
+        if act=="journal":
+            pid=action.get("project_id",""); desc=action.get("description","")
+            po=proj_po(ss.worksheet("Projects"),pid)
+            ss.worksheet("Journal").append_row([pid,po,desc,now_s,uname], value_input_option="USER_ENTERED")
+            return f"✅ Journal entry added!\n🆔 {pid} ({po})\n📝 {desc}"
+
+        if act=="pay_sub":
+            sn=action.get("sub_name",""); amt=float(action.get("amount",0))
+            ss.worksheet("Payroll").append_row(["",sn,amt,now_s,uname], value_input_option="USER_ENTERED")
+            update_summary_sheet(ss)
+            return f"✅ Paid!\n👷 {sn}: ${amt:,.2f}"
+
+        if act=="set_rate":
+            sn=action.get("sub_name",""); rate=float(action.get("rate",0))
+            sh=ss.worksheet("Subs")
+            for i,r in enumerate(sh.get_all_values()[1:],2):
+                if r[1].lower().strip()==sn.lower().strip():
+                    sh.update(f"F{i}",[[rate]])
+                    return f"✅ {sn} rate → ${rate}/hr"
+            return f"❌ Sub '{sn}' not found."
+
+        if act=="record_hours":
+            sn=action.get("sub_name",""); hrs=float(action.get("hours",0)); pid=action.get("project_id","")
+            dt=action.get("date","")
+            if not dt or dt=="today": dt=datetime.now().strftime("%Y-%m-%d")
+            po=proj_po(ss.worksheet("Projects"),pid) if pid else ""
+            sub_tid=""
+            for r in ss.worksheet("Subs").get_all_values()[1:]:
+                if r[1].lower().strip()==sn.lower().strip(): sub_tid=r[0]; break
+            ss.worksheet("Shifts").append_row([dt,sn,sub_tid,pid,f"{dt} 09:00",f"{dt} {9+hrs:.0f}:00",hrs,po], value_input_option="USER_ENTERED")
+            rate=0
+            for s in approved_subs(ss):
+                if s["name"].lower().strip()==sn.lower().strip(): rate=s["rate"]; break
+            update_summary_sheet(ss); update_timesheet_sheet(ss); update_project_hours_sheet(ss)
+            if rate>0:
+                pay=round(hrs*rate,2)
+                ss.worksheet("Payroll").append_row(["",sn,pay,f"{dt} (manual)",uname], value_input_option="USER_ENTERED")
+                return f"✅ {sn}: {hrs}h on {dt}\n💵 Auto-pay: ${pay:,.2f} ({hrs}h × ${rate}/hr)"
+            return f"✅ {sn}: {hrs}h on {dt}\n⚠️ No rate set — payroll not calculated."
+
+        if act=="add_customer":
+            cs=ss.worksheet("Customers"); cid=next_cid(cs)
+            cs.append_row([cid,action.get("name",""),action.get("address",""),action.get("phone",""),action.get("email",""),"",action.get("communication",""),"",now_s,uname], value_input_option="USER_ENTERED")
+            return f"✅ Customer added: {action.get('name','')}"
+
+        if act=="update_project":
+            pid=action.get("project_id",""); field=action.get("field",""); value=action.get("value","")
+            ps=ss.worksheet("Projects"); rn=find_proj_row(ps,pid)
+            if rn<1: return "❌ Project not found."
+            col_map={"po":"B","customer":"C","address":"D","description":"E","price":"F"}
+            col=col_map.get(field)
+            if not col: return f"❌ Unknown field: {field}"
+            ps.update(f"{col}{rn}",[[value]], value_input_option="USER_ENTERED")
+            po=proj_po(ps,pid)
+            ss.worksheet("Journal").append_row([pid,po,f"{field} → {value}",now_s,uname], value_input_option="USER_ENTERED")
+            return f"✅ Project {pid} updated: {field} = {value}"
+
+        if act=="update_customer":
+            name=action.get("name",""); field=action.get("field",""); value=action.get("value","")
+            cs=ss.worksheet("Customers")
+            col_map={"phone":"D","email":"E","communication":"G","address":"C","description":"H"}
+            col=col_map.get(field)
+            if not col: return f"❌ Unknown field: {field}"
+            for i,r in enumerate(cs.get_all_values()[1:],2):
+                if len(r)>1 and r[1].lower().strip()==name.lower().strip():
+                    cs.update(f"{col}{i}",[[value]], value_input_option="USER_ENTERED")
+                    return f"✅ Customer {name} updated: {field} = {value}"
+            return f"❌ Customer '{name}' not found."
+
+        return "❌ Unknown action."
+    except Exception as e:
+        log.error(f"Apply action error: {e}")
+        return f"❌ Error: {e}"
+
+async def ai_confirm_cb(update, ctx):
+    q=update.callback_query; await q.answer()
+    if q.data=="aicancel":
+        ctx.user_data.pop("pending_action",None); ctx.user_data.pop("pending_text",None)
+        await q.edit_message_text("❌ Отменено.")
+        await q.message.reply_text("Menu:", reply_markup=OWNER_KB)
+        return OWNER_MENU_ST
+
+    if q.data=="aiedit":
+        await q.edit_message_text("✏️ Опиши, что исправить (или пришли заново):")
+        return AI_EDIT_ST
+
+    if q.data=="aiok":
+        action=ctx.user_data.get("pending_action",{})
+        uname=owner_name(q.from_user.id); now_s=datetime.now().strftime("%Y-%m-%d %H:%M")
+        try: ss=get_ss()
+        except Exception as e:
+            log.error(f"DB: {e}")
+            await q.edit_message_text("❌ Database error.")
+            await q.message.reply_text("Menu:", reply_markup=OWNER_KB)
+            return OWNER_MENU_ST
+        msg=await apply_write_action(ss, action, uname, now_s)
+        ctx.user_data.pop("pending_action",None); ctx.user_data.pop("pending_text",None)
+        await q.edit_message_text(msg)
+        await q.message.reply_text("Menu:", reply_markup=OWNER_KB)
+        return OWNER_MENU_ST
+
+async def ai_edit_text(update, ctx):
+    correction=update.message.text
+    original=ctx.user_data.get("pending_text","")
+    try: ss=get_ss(); projs=all_projects(ss.worksheet("Projects")); subs=approved_subs(ss)
+    except Exception as e:
+        log.error(f"DB: {e}"); await update.message.reply_text("❌ Database error.", reply_markup=OWNER_KB); return OWNER_MENU_ST
+
+    await update.message.reply_text("⏳ Processing...")
+    merged=f"{original}\n\nCORRECTION: {correction}"
+    action=ai_parse(merged, projs, subs)
+    act=action.get("action","unknown")
+
+    if act not in CONFIRM_ACTIONS:
+        ctx.user_data.pop("pending_action",None); ctx.user_data.pop("pending_text",None)
+        reply=action.get("reply","Не удалось разобрать правку. Попробуй ещё раз с нуля.")
+        await update.message.reply_text(reply, reply_markup=OWNER_KB)
+        return OWNER_MENU_ST
+
+    ctx.user_data["pending_action"]=action
+    ctx.user_data["pending_text"]=merged
+    await update.message.reply_text(f"{describe_action(ss,action)}\n\nВсё верно?", parse_mode="Markdown", reply_markup=CONFIRM_BTNS)
+    return AI_CONFIRM_ST
 
 # ============================================================
 # SHOW PROJECT / SUMMARY / ARCHIVE

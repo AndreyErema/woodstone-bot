@@ -7,7 +7,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 from config import log, owner_name, OWNER_MENU_ST, CONFIRM_ACTION
 from keyboards import OWNER_KB
-from sheets import get_ss, active_shift, active_projects, proj_po
+from sheets import get_ss, active_shift, active_projects, proj_po, update_timesheet_sheet, update_project_hours_sheet
 
 async def owner_shift_start(update, ctx):
     uid=update.effective_user.id
@@ -42,6 +42,7 @@ async def owner_shift_end(update, ctx):
         sh=ss.worksheet("Shifts"); now=datetime.now(); now_s=now.strftime("%Y-%m-%d %H:%M")
         start=datetime.strptime(a["start"],"%Y-%m-%d %H:%M"); hrs=round((now-start).total_seconds()/3600,2)
         sh.update(f"F{a['row']}",[[now_s]]); sh.update(f"G{a['row']}",[[hrs]])
+        update_timesheet_sheet(ss); update_project_hours_sheet(ss)
         await update.message.reply_text(f"🔴 Shift ended!\n👤 {name}\n📍 {a['po']}\n⏱ {hrs}h", reply_markup=OWNER_KB)
     except Exception as e:
         log.error(f"Shift end: {e}"); await update.message.reply_text("❌", reply_markup=OWNER_KB)
