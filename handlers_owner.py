@@ -19,11 +19,11 @@ from keyboards import OWNER_KB, SUB_KB
 from sheets import (
     get_ss, sub_info, next_pid, next_cid, active_projects, all_projects,
     find_proj_row, proj_po, update_totals, approved_subs, update_summary_sheet, build_summary,
-    update_timesheet_sheet, update_project_hours_sheet,
 )
 from ai import ai_parse
 from handlers_scan import show_proj_btns
 from handlers_shifts import owner_shift_start, owner_shift_end
+from sheet_deploy import deploy_all
 
 # Actions that change data and must be confirmed by the owner before writing.
 CONFIRM_ACTIONS = {
@@ -100,6 +100,7 @@ def describe_action(ss, action):
     if act=="create_project":
         return (f"📋 *Новый проект*\nPO: {action.get('po') or '—'}\n"
                 f"Клиент: {action.get('customer') or '—'}\n"
+                f"Телефон: {action.get('phone') or '—'}\n"
                 f"Адрес: {action.get('address') or '—'}\n"
                 f"Описание: {action.get('description') or '—'}\n"
                 f"Цена: ${float(action.get('price',0) or 0):,.2f}")
@@ -188,16 +189,16 @@ async def apply_write_action(ss, action, uname, now_s):
     try:
         if act=="create_project":
             ps=ss.worksheet("Projects"); pid=next_pid(ps)
-            po=action.get("po",""); cust=action.get("customer",""); addr=action.get("address",""); desc=action.get("description",""); price=float(action.get("price",0))
+            po=action.get("po",""); cust=action.get("customer",""); phone=action.get("phone",""); addr=action.get("address",""); desc=action.get("description",""); price=float(action.get("price",0))
             if not po and addr: po=addr[:30]
             ps.append_row([pid,po,cust,addr,desc,price,"New",0,0,0,now_s,uname], value_input_option="USER_ENTERED")
             update_totals(ss,pid)
             if cust:
                 try:
                     cs=ss.worksheet("Customers"); cid=next_cid(cs)
-                    cs.append_row([cid,cust,addr,"","",po,"","",now_s,uname], value_input_option="USER_ENTERED")
+                    cs.append_row([cid,cust,addr,phone,"",po,"","",now_s,uname], value_input_option="USER_ENTERED")
                 except:pass
-            return f"✅ Project created!\n🆔 {pid}\n📋 PO: {po}\n👤 Customer: {cust or '—'}\n📍 {addr}\n📝 {desc or '—'}\n💵 ${price:,.2f}"
+            return f"✅ Project created!\n🆔 {pid}\n📋 PO: {po}\n👤 Customer: {cust or '—'}\n📞 {phone or '—'}\n📍 {addr}\n📝 {desc or '—'}\n💵 ${price:,.2f}"
 
         if act=="payment":
             pid=action.get("project_id",""); amt=float(action.get("amount",0)); note=action.get("note","")
@@ -255,7 +256,7 @@ async def apply_write_action(ss, action, uname, now_s):
             rate=0
             for s in approved_subs(ss):
                 if s["name"].lower().strip()==sn.lower().strip(): rate=s["rate"]; break
-            update_summary_sheet(ss); update_timesheet_sheet(ss); update_project_hours_sheet(ss)
+            update_summary_sheet(ss)
             if rate>0:
                 pay=round(hrs*rate,2)
                 ss.worksheet("Payroll").append_row(["",sn,pay,f"{dt} (manual)",uname], value_input_option="USER_ENTERED")
@@ -377,9 +378,20 @@ async def do_show_project(update, ctx, ss, pid):
 async def do_summary(update, ctx):
     try:
         ss=get_ss(); t=build_summary(ss)
-        await update.message.reply_text(t, parse_mode="Markdown", reply_markup=OWNER_KB)
+        await update.message.reply_text(t, reply_markup=OWNER_KB)
     except: await update.message.reply_text("❌ Error.", reply_markup=OWNER_KB)
     return OWNER_MENU_ST
+
+async def deploy_sheet_cmd(update, ctx):
+    uid=update.effective_user.id
+    if not is_owner(uid): return
+    await update.message.reply_text("⏳ Deploying Timesheet / Project Hours structure...")
+    try:
+        ss=get_ss(); deploy_all(ss)
+        await update.message.reply_text("✅ Done. Timesheet and Project Hours are set up — pick a period in their A2/B2 cells.", reply_markup=OWNER_KB)
+    except Exception as e:
+        log.error(f"deploy_sheet: {e}")
+        await update.message.reply_text(f"❌ Error: {e}", reply_markup=OWNER_KB)
 
 async def do_archive(update, ctx):
     try:

@@ -19,7 +19,7 @@ from config import (
     CONFIRM_ACTION, AI_CONFIRM_ST, AI_EDIT_ST,
 )
 from sheets import get_ss, init
-from handlers_owner import start, cancel_cmd, owner_handler, free_text_handler, ai_confirm_cb, ai_edit_text
+from handlers_owner import start, cancel_cmd, owner_handler, free_text_handler, ai_confirm_cb, ai_edit_text, deploy_sheet_cmd
 from handlers_scan import (
     receipt_proj_select, invoice_proj_select, photo_received,
     scan_confirm, scan_manual_amt,
@@ -34,6 +34,7 @@ def main():
 
     app=Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CallbackQueryHandler(approve_sub, pattern="^(approve_|reject_)"))
+    app.add_handler(CommandHandler("deploy_sheet", deploy_sheet_cmd))
 
     ch=ConversationHandler(
         entry_points=[CommandHandler("start",start)],

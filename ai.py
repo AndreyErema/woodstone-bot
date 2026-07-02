@@ -36,7 +36,7 @@ CURRENT SUBS:
 {sub_list}
 
 AVAILABLE ACTIONS (return exactly one):
-- {{"action":"create_project","po":"short name","customer":"client name","address":"full address","description":"work description","price":number_or_0}}
+- {{"action":"create_project","po":"short name","customer":"client name","phone":"client phone or empty","address":"full address","description":"work description","price":number_or_0}}
 - {{"action":"payment","project_id":"N","amount":number,"note":"optional note"}}
 - {{"action":"expense","project_id":"N","category":"Materials|Subcontractor|Equipment Rental|Other","amount":number,"description":"what"}}
 - {{"action":"change_status","project_id":"N","status":"New|In Progress|On Hold|Completed"}}
@@ -57,6 +57,8 @@ AVAILABLE ACTIONS (return exactly one):
 RULES:
 - Match projects by ID, PO, address fragment, or street number. "773" matches "773 Central Heights". "Falling Leaf" matches "2090 Falling Leaf".
 - Match subs by name (partial ok). "Родя" = "Родя", "Дане" = "Даня".
+- create_project "po": if the user did NOT explicitly give a project name/label, derive it from the address as "house number + street or city" (e.g. "102 E 5th Watauga" for "102 E. 5th Avenue, Watauga TN 37694"). NEVER put the type/description of work (e.g. "landscaping and patio") into "po" — that belongs in "description" only.
+- Any phone number in the message (digits, possibly with dashes) that belongs to the client goes into "phone", never into "description" or "po".
 - If user mentions receiving money/check/deposit FROM client → payment. If user mentions spending/buying/purchasing → expense.
 - "закрой проект" or "close project" → status Completed.
 - If the user is correcting/renaming a field of a project or customer that already exists (e.g. "PO пусть будет 671", "смени адрес на ...", "поменяй телефон клиента ..."), use update_project or update_customer — do NOT create a new project/customer for this.

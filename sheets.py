@@ -4,7 +4,6 @@ Google Sheets client, schema init, and data access helpers.
 
 from datetime import datetime, timedelta
 import gspread
-from gspread.utils import rowcol_to_a1
 from google.oauth2.service_account import Credentials
 
 from config import SPREADSHEET_ID, GOOGLE_CREDS_FILE, is_owner, owner_name, log
@@ -27,6 +26,34 @@ def gs(ss, title, headers):
         sh = ss.add_worksheet(title=title, rows=1000, cols=len(headers))
         sh.append_row(headers, value_input_option="USER_ENTERED"); return sh
 
+CUSTOMERS_HEADERS = ["Customer ID","Name","Address","phone","email","projects (PO)","Communication","Description","Data","Posted by"]
+
+def repair_customers_sheet(ss):
+    """Migrate an older Customers sheet (created before the Communication
+    column existed) to the current schema, inserting the missing column
+    without disturbing existing data."""
+    try:
+        cs=ss.worksheet("Customers")
+        data=cs.get_all_values()
+        if not data: return
+        headers=data[0]
+        if headers==CUSTOMERS_HEADERS or "Communication" in headers: return
+        old_headers=[h for h in CUSTOMERS_HEADERS if h!="Communication"]
+        if headers[:len(old_headers)]!=old_headers:
+            log.error(f"Customers sheet headers unrecognized, skipping repair: {headers}")
+            return
+        comm_idx=CUSTOMERS_HEADERS.index("Communication")
+        new_rows=[CUSTOMERS_HEADERS]
+        for r in data[1:]:
+            r=list(r)+[""]*max(0,len(old_headers)-len(r))
+            new_rows.append(r[:comm_idx]+[""]+r[comm_idx:])
+        cs.clear()
+        if cs.col_count<len(CUSTOMERS_HEADERS): cs.resize(cols=len(CUSTOMERS_HEADERS))
+        cs.update("A1",new_rows,value_input_option="USER_ENTERED")
+        log.info("Customers sheet repaired: added Communication column")
+    except Exception as e:
+        log.error(f"Customers repair: {e}")
+
 def init(ss):
     gs(ss,"Projects",["Project ID","PO","Customer","Address","Description","Price","Status","Incom","Expenses","balance","Date","Posted by"])
     gs(ss,"Payments",["Project ID","PO","Amount","Data","Posted by","Check"])
@@ -35,8 +62,9 @@ def init(ss):
     gs(ss,"Payroll",["ID","Sub","Amount","Data","Posted by"])
     gs(ss,"Subs",["Telegram ID","name","Date added","status","Posted by","Rate"])
     gs(ss,"Journal",["Project ID","PO","Description","Data","Posted by"])
-    gs(ss,"Customers",["Customer ID","Name","Address","phone","email","projects (PO)","Communication","Description","Data","Posted by"])
+    gs(ss,"Customers",CUSTOMERS_HEADERS)
     gs(ss,"Summary",["Metric","Value","Note"])
+    repair_customers_sheet(ss)
 
 # ============================================================
 # HELPERS
@@ -121,51 +149,61 @@ def active_shift(ss,uid):
 # SUMMARY
 # ============================================================
 def build_summary(ss):
+    """Weekly chat summary: account balance, this week's expenses by
+    category, this week's hours/pay per sub, and this week's hours per
+    project. Plain text, no icons/markdown."""
     now=datetime.now()
-    # Find Monday of current week
     mon=now-timedelta(days=now.weekday())
     fri=mon+timedelta(days=4)
     mon_s=mon.strftime("%Y-%m-%d"); fri_s=fri.strftime("%Y-%m-%d")
 
-    ps=ss.worksheet("Projects").get_all_values()
-    tp=tr=te=0;ac=cc=0
-    for r in ps[1:]:
-        try:
-            p=float(r[5]) if r[5] else 0;rc=float(r[7]) if len(r)>7 and r[7] else 0
-            ex=float(r[8]) if len(r)>8 and r[8] else 0;st=r[6] if len(r)>6 else ""
-            tp+=p;tr+=rc;te+=ex
-            if st=="Completed":cc+=1
-            else:ac+=1
-        except:pass
-    wpay=wexp=wzp=0;ebc={};zbs={};tzp=0
-    for r in ss.worksheet("Payments").get_all_values()[1:]:
-        try:
-            ds=r[3][:10]
-            if mon_s<=ds<=fri_s: wpay+=float(r[2])
-        except:pass
+    proj_rows=ss.worksheet("Projects").get_all_values()[1:]
+
+    bal=0
+    proj_po={}
+    for r in proj_rows:
+        try: bal+=float(r[9]) if len(r)>9 and r[9] else 0
+        except: pass
+        if r and r[0]: proj_po[r[0]]=r[1] if len(r)>1 else ""
+
+    ebc={}
     for r in ss.worksheet("Expenses").get_all_values()[1:]:
         try:
-            cat=r[2];amt=float(r[3]);ds=r[5][:10]
-            ebc[cat]=ebc.get(cat,0)+amt
-            if mon_s<=ds<=fri_s: wexp+=amt
-        except:pass
-    for r in ss.worksheet("Payroll").get_all_values()[1:]:
+            cat=r[2]; amt=float(r[3]); ds=r[5][:10]
+            if mon_s<=ds<=fri_s: ebc[cat]=ebc.get(cat,0)+amt
+        except: pass
+
+    rates={s["name"]:s["rate"] for s in approved_subs(ss)}
+    hrs_by_sub={}; hrs_by_proj={}
+    for r in ss.worksheet("Shifts").get_all_values()[1:]:
         try:
-            s=r[1];a=float(r[2]);ds=r[3][:10]
-            tzp+=a;zbs[s]=zbs.get(s,0)+a
-            if mon_s<=ds<=fri_s: wzp+=a
-        except:pass
-    bal=tr-te-tzp;co=tp-tr
-    t=f"📊 *WEEKLY SUMMARY*\n📅 {mon.strftime('%m/%d')} — {fri.strftime('%m/%d/%Y')} (Mon-Fri)\n\n"
-    t+=f"*This week:*\n💰 Received: ${wpay:,.2f}\n💸 Expenses: ${wexp:,.2f}\n👷 Payroll: ${wzp:,.2f}\n"
-    t+=f"\n*Total:*\n🏗 Active: {ac}\n💵 Total value: ${tp:,.2f}\n✅ Received: ${tr:,.2f}\n"
-    t+=f"💸 Expenses: ${te:,.2f}\n👷 Payroll: ${tzp:,.2f}\n📈 Owed by clients: ${co:,.2f}\n💰 Balance: ${bal:,.2f}\n"
+            ds=r[0][:10]
+            if not (mon_s<=ds<=fri_s): continue
+            sn=r[1] if len(r)>1 else ""; hrs=float(r[6]) if len(r)>6 and r[6] else 0
+            pid=r[3] if len(r)>3 else ""
+            if sn: hrs_by_sub[sn]=hrs_by_sub.get(sn,0)+hrs
+            if pid: hrs_by_proj[pid]=hrs_by_proj.get(pid,0)+hrs
+        except: pass
+
+    t=f"Неделя: {mon.strftime('%m/%d')} — {fri.strftime('%m/%d')} (Mon-Fri)\n\n"
+    t+=f"Balance: ${bal:,.2f}\n"
+
     if ebc:
-        t+="\n*By category:*\n"
-        for c,a in sorted(ebc.items()): t+=f"  • {c}: ${a:,.2f}\n"
-    if zbs:
-        t+="\n*Payroll by sub:*\n"
-        for s,a in sorted(zbs.items()): t+=f"  • {s}: ${a:,.2f}\n"
+        t+="\nExpenses:\n"
+        for c,a in sorted(ebc.items()): t+=f"  {c}: ${a:,.2f}\n"
+
+    if hrs_by_sub:
+        t+="\nHours/$:\n"
+        for sn,h in sorted(hrs_by_sub.items()):
+            rate=rates.get(sn,0)
+            if rate>0: t+=f"  {sn}: {h:g}h — к оплате ${h*rate:,.2f}\n"
+            else: t+=f"  {sn}: {h:g}h — ставка не задана\n"
+
+    if hrs_by_proj:
+        t+="\nProjects Hours:\n"
+        for pid,h in sorted(hrs_by_proj.items(), key=lambda kv: proj_po.get(kv[0],kv[0])):
+            t+=f" {proj_po.get(pid,pid)} — {h:g}h\n"
+
     return t
 
 def update_summary_sheet(ss):
@@ -265,58 +303,7 @@ def update_summary_sheet(ss):
         sh.update("A1",mx,value_input_option="USER_ENTERED")
     except Exception as e:log.error(f"Summary: {e}")
 
-# ============================================================
-# PIVOT SHEETS (Timesheet, Project Hours) — live SUMIFS formulas,
-# native Sheets filter for period/column filtering.
-# ============================================================
-def _sheets_str(s):
-    return '"' + str(s).replace('"','""') + '"'
-
-def _write_pivot_sheet(ss, title, mx):
-    try:sh=ss.worksheet(title);sh.clear()
-    except:sh=ss.add_worksheet(title=title,rows=len(mx)+10,cols=len(mx[0])+2)
-    if sh.col_count<len(mx[0]):sh.resize(cols=len(mx[0]))
-    if sh.row_count<len(mx):sh.resize(rows=len(mx)+5)
-    sh.update("A1",mx,value_input_option="USER_ENTERED")
-    try:sh.set_basic_filter()
-    except Exception:pass
-
-def update_timesheet_sheet(ss):
-    """Days × subs pivot. Filter arrows on the header let owners filter by date/sub in Sheets directly."""
-    try:
-        rows=ss.worksheet("Shifts").get_all_values()[1:]
-        dates=sorted({r[0] for r in rows if r and r[0]})
-        subs=sorted({r[1] for r in rows if len(r)>1 and r[1]})
-        if not dates or not subs: return
-        headers=["Date"]+subs+["Total"]
-        mx=[headers]
-        for i,d in enumerate(dates,start=2):
-            row=[d]
-            for s in subs:
-                row.append(f'=SUMIFS(Shifts!$G:$G,Shifts!$A:$A,$A{i},Shifts!$B:$B,{_sheets_str(s)})')
-            last_col=rowcol_to_a1(i,len(subs)+1).rstrip("0123456789")
-            row.append(f'=SUM(B{i}:{last_col}{i})')
-            mx.append(row)
-        _write_pivot_sheet(ss,"Timesheet",mx)
-    except Exception as e:log.error(f"Timesheet: {e}")
-
-def update_project_hours_sheet(ss):
-    """Projects × subs pivot. Filter arrows on the header let owners filter by project/sub in Sheets directly."""
-    try:
-        sh_d=ss.worksheet("Shifts").get_all_values()[1:]
-        proj_d=ss.worksheet("Projects").get_all_values()[1:]
-        pid_po={r[0]:(r[1] if len(r)>1 else "") for r in proj_d if r and r[0]}
-        pids=sorted({r[3] for r in sh_d if len(r)>3 and r[3]})
-        subs=sorted({r[1] for r in sh_d if len(r)>1 and r[1]})
-        if not pids or not subs: return
-        headers=["Project"]+subs+["Total"]
-        mx=[headers]
-        for i,pid in enumerate(pids,start=2):
-            row=[f"{pid} — {pid_po.get(pid,'')}"]
-            for s in subs:
-                row.append(f'=SUMIFS(Shifts!$G:$G,Shifts!$D:$D,{_sheets_str(pid)},Shifts!$B:$B,{_sheets_str(s)})')
-            last_col=rowcol_to_a1(i,len(subs)+1).rstrip("0123456789")
-            row.append(f'=SUM(B{i}:{last_col}{i})')
-            mx.append(row)
-        _write_pivot_sheet(ss,"Project Hours",mx)
-    except Exception as e:log.error(f"Project Hours: {e}")
+# Timesheet / Project Hours are no longer built here — see sheet_deploy.py.
+# They're 100% Google Sheets formulas (period cells + QUERY/SEQUENCE/BYROW/
+# BYCOL), set up once via the /deploy_sheet command and never touched again
+# by the bot.
