@@ -36,14 +36,20 @@ def _existing_period(sh):
     """Only trust A2/B2 as a previously-set period if this sheet was already
     in our layout (A1 marker) AND both cells actually parse as dates —
     otherwise a sheet left over from an older layout (or a fresh one) would
-    have its leftover data cells misread as period dates."""
+    have its leftover data cells misread as period dates. Whatever format
+    the cell happened to display in (e.g. ISO if some earlier bug/format
+    left it that way), always re-normalize to MM/DD/YYYY before writing it
+    back — Sheets' USER_ENTERED parser doesn't reliably recognize ISO dates
+    under a US locale, and a plain-text date silently breaks every formula
+    that does date arithmetic on it."""
     vals = sh.get_all_values()
     if not vals or not vals[0] or (vals[0][0] if vals[0] else "") != "Выбрать период":
         return "", ""
     a2 = vals[1][0] if len(vals) > 1 and len(vals[1]) > 0 else ""
     b2 = vals[1][1] if len(vals) > 1 and len(vals[1]) > 1 else ""
-    if _parse_date_loose(a2) and _parse_date_loose(b2):
-        return a2, b2
+    da, db = _parse_date_loose(a2), _parse_date_loose(b2)
+    if da and db:
+        return da.strftime("%m/%d/%Y"), db.strftime("%m/%d/%Y")
     return "", ""
 
 TIMESHEET_HEADER_FORMULA = '''=TRANSPOSE(SORT(UNIQUE(FILTER(Shifts!B2:B,(Shifts!A2:A>=TEXT($A$2,"yyyy-mm-dd"))*(Shifts!A2:A<=TEXT($B$2,"yyyy-mm-dd")),Shifts!B2:B<>""))))'''
@@ -66,6 +72,8 @@ def deploy_timesheet_sheet(ss):
 
     sh.update("A1", [["Выбрать период"]], value_input_option="USER_ENTERED")
     sh.update("A2", [[a2 or ds, b2 or de]], value_input_option="USER_ENTERED")
+    try: sh.format("A2:B2", {"numberFormat": {"type": "DATE", "pattern": "mm/dd/yyyy"}})
+    except Exception: pass
 
     sh.update("A4", [["Сотрудник →"]], value_input_option="USER_ENTERED")
     sh.update("B4", [[TIMESHEET_HEADER_FORMULA]], value_input_option="USER_ENTERED")
@@ -100,6 +108,8 @@ def deploy_project_hours_sheet(ss):
 
     sh.update("A1", [["Выбрать период"]], value_input_option="USER_ENTERED")
     sh.update("A2", [[a2 or ds, b2 or de]], value_input_option="USER_ENTERED")
+    try: sh.format("A2:B2", {"numberFormat": {"type": "DATE", "pattern": "mm/dd/yyyy"}})
+    except Exception: pass
 
     sh.update("D1", [["Итого часов за период"]], value_input_option="USER_ENTERED")
     sh.update("D2", [[PROJECT_HOURS_TOTAL_FORMULA]], value_input_option="USER_ENTERED")
