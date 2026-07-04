@@ -52,7 +52,7 @@ def _existing_period(sh):
         return da.strftime("%m/%d/%Y"), db.strftime("%m/%d/%Y")
     return "", ""
 
-TIMESHEET_HEADER_FORMULA = '''=TRANSPOSE(QUERY(Shifts!A2:B1000,"select B where A>='"&TEXT($A$2,"yyyy-mm-dd")&"' and A<='"&TEXT($B$2,"yyyy-mm-dd")&"' and B<>'' group by B label B ''",0))'''
+TIMESHEET_HEADER_FORMULA = '''=IFERROR(TRANSPOSE(QUERY(Shifts!A2:B1000,"select B where A>=date '"&TEXT($A$2,"yyyy-mm-dd")&"' and A<=date '"&TEXT($B$2,"yyyy-mm-dd")&"' and B<>'' group by B label B ''",0)),"Нет данных за период")'''
 TIMESHEET_DATES_FORMULA = '''=SEQUENCE($B$2-$A$2+1,1,$A$2,1)'''
 TIMESHEET_GRID_FORMULA = '''=BYROW(A9#,LAMBDA(d,BYCOL(B4#,LAMBDA(s,IF(SUMIFS(Shifts!$G:$G,Shifts!$A:$A,TEXT(d,"yyyy-mm-dd"),Shifts!$B:$B,s)=0,"Выходной",SUMIFS(Shifts!$G:$G,Shifts!$A:$A,TEXT(d,"yyyy-mm-dd"),Shifts!$B:$B,s))))))'''
 TIMESHEET_TOTAL_FORMULA = '''=BYCOL(B9#,LAMBDA(col,SUMIF(col,"<>Выходной")))'''
@@ -91,7 +91,7 @@ def deploy_timesheet_sheet(ss):
     try: sh.format("A9:A60", {"numberFormat": {"type": "DATE", "pattern": "yyyy-mm-dd"}})
     except Exception: pass
 
-PROJECT_HOURS_QUERY_FORMULA = '''=QUERY(Shifts!A2:H1000,"select H, sum(G) where A>='"&TEXT($A$2,"yyyy-mm-dd")&"' and A<='"&TEXT($B$2,"yyyy-mm-dd")&"' and H<>'' group by H label H 'Project', sum(G) 'Hours'",0)'''
+PROJECT_HOURS_QUERY_FORMULA = '''=QUERY(Shifts!A2:H1000,"select H, sum(G) where A>=date '"&TEXT($A$2,"yyyy-mm-dd")&"' and A<=date '"&TEXT($B$2,"yyyy-mm-dd")&"' and H<>'' group by H label H 'Project', sum(G) 'Hours'",0)'''
 PROJECT_HOURS_TOTAL_FORMULA = '''=SUMIFS(Shifts!$G:$G,Shifts!$A:$A,">="&TEXT($A$2,"yyyy-mm-dd"),Shifts!$A:$A,"<="&TEXT($B$2,"yyyy-mm-dd"))'''
 
 def deploy_project_hours_sheet(ss):

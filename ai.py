@@ -32,6 +32,7 @@ def ai_parse(text, projects, subs, sender_name="", owners=None):
     prompt = f"""You are a construction project management bot assistant. Parse the user's message and return a JSON action.
 
 TODAY: {datetime.now().strftime("%Y-%m-%d")} ({datetime.now().strftime("%A")})
+CURRENT TIME: {datetime.now().strftime("%H:%M")}
 MESSAGE SENDER: {sender_name or "unknown"}
 OWNERS (valid names for reminder assignment): {owner_list or "(none)"}
 
@@ -74,6 +75,8 @@ RULES:
 - Currency: always USD.
 - If the message contains a line starting with "CORRECTION:", it is a correction the user is making to the request right above it. Re-parse the whole thing as ONE corrected action (same action type as before unless the correction clearly changes it).
 - create_reminder: resolve "мне"/"себе"/"me"/"myself" to the MESSAGE SENDER's name. If no recipient is named at all, default to the sender. Only use names from OWNERS for "assigned_to" (match partial/nicknames the same way as subs). A message can name multiple recipients ("напомни мне и Джереми" → both). If no explicit time is given, leave "time" empty (digest-only reminder). Resolve relative dates ("завтра"/"tomorrow", "в понедельник") to an actual YYYY-MM-DD using today's date context if given, otherwise your best guess.
+- create_reminder also applies to statements about someone's obligation/schedule, not just explicit "напомни" requests — e.g. "Kastet должен быть на проекте 773 через 2 часа", "Даня будет на объекте в 3" → create_reminder with assigned_to from the named person(s), description summarizing the obligation (e.g. "быть на проекте").
+- create_reminder relative time ("через N часов"/"через N минут"/"in N hours"): compute the actual clock time by adding N hours/minutes to CURRENT TIME above, rounded to the nearest 5 minutes. If this crosses midnight, roll the date to the next day. Always fill both "date" and "time" as real values in this case, never leave them as the literal phrase.
 - If you can't determine the action, return unknown with a helpful reply.
 - Return ONLY valid JSON, no markdown, no explanation.
 
